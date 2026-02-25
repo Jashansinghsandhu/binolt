@@ -2983,11 +2983,11 @@ async def cb_tgold_country(query: CallbackQuery) -> None:
     available_count = len(products)
     price = products[0].price
     await query.message.edit_text(
-        f"🌍 <b>{get_country_flag(country)} {country.title()}</b>\n"
-        f"📁 <b>Category:</b> 📱 Telegram Old Accounts ({year})\n\n"
+        f"<tg-emoji emoji-id=\"5224450179368767019\">🌍</tg-emoji> <b>{get_country_flag(country)} {country.title()}</b>\n"
+        f"<tg-emoji emoji-id=\"5305265301917549162\">📁</tg-emoji> <b>Category:</b> <tg-emoji emoji-id=\"5197252827247841976\">📱</tg-emoji> Telegram Old Accounts ({year})\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📱 <b>Available Numbers:</b> {available_count}\n"
-        f"💰 <b>Price per Number:</b> ${price:.2f} USDT\n"
+        f"<tg-emoji emoji-id=\"5197252827247841976\">📱</tg-emoji> <b>Available Numbers:</b> {available_count}\n"
+        f"<tg-emoji emoji-id=\"5409048419211682843\">💰</tg-emoji> <b>Price per Number:</b> ${price:.2f} USDT\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Click <b>Buy Now</b> to purchase a random number from this pool.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -3065,9 +3065,9 @@ async def cb_tgold_confirm(query: CallbackQuery) -> None:
             ), 'danger', "5416041192905265756")],
         ])
         balance_line = (
-            f"💰 <b>Your Balance:</b> ${user_balance:.2f} USDT\n"
-            f"💵 <b>Cost:</b> ${price:.2f} USDT\n"
-            f"📉 <b>Balance after purchase:</b> ${balance_after:.2f} USDT"
+            f"<tg-emoji emoji-id=\"5409048419211682843\">💰</tg-emoji> <b>Your Balance:</b> ${user_balance:.2f} USDT\n"
+            f"<tg-emoji emoji-id=\"5197434882321567830\">💵</tg-emoji> <b>Cost:</b> ${price:.2f} USDT\n"
+            f"<tg-emoji emoji-id=\"5332455502917949981\">📉</tg-emoji> <b>Balance after purchase:</b> ${balance_after:.2f} USDT"
         )
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -3078,16 +3078,16 @@ async def cb_tgold_confirm(query: CallbackQuery) -> None:
             ), 'danger', "5416041192905265756")],
         ])
         balance_line = (
-            f"💰 <b>Your Balance:</b> ${user_balance:.2f} USDT\n"
-            f"💵 <b>Required:</b> ${price:.2f} USDT\n\n"
+            f"<tg-emoji emoji-id=\"5409048419211682843\">💰</tg-emoji> <b>Your Balance:</b> ${user_balance:.2f} USDT\n"
+            f"<tg-emoji emoji-id=\"5197434882321567830\">💵</tg-emoji> <b>Required:</b> ${price:.2f} USDT\n\n"
             f"❌ <b>Insufficient balance.</b> Please deposit funds first."
         )
 
     await query.message.edit_text(
-        f"🛒 <b>Confirm Purchase</b>\n\n"
-        f"🌍 <b>Country:</b> {flag} {country.title()}\n"
-        f"📅 <b>Year:</b> {year}\n"
-        f"📱 <b>Available:</b> {available_count} number(s)\n"
+        f"<tg-emoji emoji-id=\"5406683434124859552\">🛒</tg-emoji> <b>Confirm Purchase</b>\n\n"
+        f"<tg-emoji emoji-id=\"5224450179368767019\">🌍</tg-emoji> <b>Country:</b> {flag} {country.title()}\n"
+        f"<tg-emoji emoji-id=\"5274055917766202507\">📅</tg-emoji> <b>Year:</b> {year}\n"
+        f"<tg-emoji emoji-id=\"5197252827247841976\">📱</tg-emoji> <b>Available:</b> {available_count} number(s)\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"{balance_line}\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -4530,13 +4530,15 @@ async def cb_admin_add_year(query: CallbackQuery, state: FSMContext) -> None:
         return
 
     await state.update_data(year=year)
-    await state.set_state(AdminAddNumber.country)
+    await state.set_state(AdminAddNumber.session_file)
 
     await query.message.edit_text(
         f"➕ <b>Add New Number</b>\n\n"
         f"📁 Category: <b>📱 Telegram Old Accounts</b>\n"
         f"📅 Year: <b>{year}</b>\n\n"
-        f"Step 3/6: Enter the <b>country name</b>:",
+        f"Step 3/5: Upload the <b>.session file</b> for this account as a document attachment.\n"
+        f"The file name must be in <code>+phonenumber.session</code> format (e.g. <code>+919876543210.session</code>).\n"
+        f"The country will be auto-detected from the phone number.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             apply_button_style(InlineKeyboardButton(text="Cancel", callback_data="admin_cancel_add"), 'danger', "5416041192905265756"),
         ]]),
@@ -4594,6 +4596,16 @@ async def fsm_add_price(message: Message, state: FSMContext) -> None:
             ]]),
             parse_mode=ParseMode.HTML,
         )
+    elif category == CATEGORY_TELEGRAM_OLD:
+        # Session file already uploaded; go directly to 2FA step
+        await state.set_state(AdminAddNumber.twofa_password)
+        await message.answer(
+            "Step 5/5: Does this account have a 2FA password? Enter it now, or send <code>0</code> to skip.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                apply_button_style(InlineKeyboardButton(text="Cancel", callback_data="admin_cancel_add"), 'danger', "5416041192905265756"),
+            ]]),
+            parse_mode=ParseMode.HTML,
+        )
     else:
         await state.set_state(AdminAddNumber.session_string)
         await message.answer(
@@ -4609,7 +4621,7 @@ async def fsm_add_price(message: Message, state: FSMContext) -> None:
 @router.message(AdminAddNumber.session_file)
 @admin_only
 async def fsm_add_session_file(message: Message, state: FSMContext) -> None:
-    """Handle .session file upload for Telegram Sessions category."""
+    """Handle .session file upload for Telegram Sessions and Telegram Old Accounts categories."""
     if not message.document:
         await message.answer(
             "❌ Please upload the <b>.session file</b> as a document attachment.",
@@ -4630,15 +4642,37 @@ async def fsm_add_session_file(message: Message, state: FSMContext) -> None:
         log.error("Error downloading session file: %s", e)
         await message.answer("❌ Failed to download the file. Please try again.")
         return
-    await state.update_data(session_file_data=file_bytes)
-    await state.set_state(AdminAddNumber.twofa_password)
-    await message.answer(
-        "Does this account have a 2FA password? Enter it now, or send <code>0</code> to skip.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            apply_button_style(InlineKeyboardButton(text="Cancel", callback_data="admin_cancel_add"), 'danger', "5416041192905265756"),
-        ]]),
-        parse_mode=ParseMode.HTML,
-    )
+
+    data = await state.get_data()
+    category = data.get("category", CATEGORY_TELEGRAM_SESSIONS)
+
+    if category == CATEGORY_TELEGRAM_OLD:
+        # Extract phone number from filename and auto-detect country
+        phone = message.document.file_name[:-len(".session")]
+        country = detect_country_from_phone(phone)
+        await state.update_data(session_file_data=file_bytes, phone=phone, country=country)
+        await state.set_state(AdminAddNumber.price)
+        flag = get_country_flag(country)
+        await message.answer(
+            f"✅ <b>.session file received!</b>\n\n"
+            f"📱 Phone: <code>{phone}</code>\n"
+            f"🌍 Country (auto-detected): <b>{flag} {country.title()}</b>\n\n"
+            f"Step 4/5: Enter the <b>price in USDT</b> (e.g. 2.00):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                apply_button_style(InlineKeyboardButton(text="Cancel", callback_data="admin_cancel_add"), 'danger', "5416041192905265756"),
+            ]]),
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await state.update_data(session_file_data=file_bytes)
+        await state.set_state(AdminAddNumber.twofa_password)
+        await message.answer(
+            "Does this account have a 2FA password? Enter it now, or send <code>0</code> to skip.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                apply_button_style(InlineKeyboardButton(text="Cancel", callback_data="admin_cancel_add"), 'danger', "5416041192905265756"),
+            ]]),
+            parse_mode=ParseMode.HTML,
+        )
 
 
 @router.message(AdminAddNumber.session_string)
@@ -4672,8 +4706,8 @@ async def fsm_add_twofa_password(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     category = data.get("category", CATEGORY_TELEGRAM_ACCOUNTS)
 
-    # For CATEGORY_TELEGRAM_SESSIONS we store raw file bytes instead of session string
-    if category == CATEGORY_TELEGRAM_SESSIONS:
+    # For CATEGORY_TELEGRAM_SESSIONS and CATEGORY_TELEGRAM_OLD we store raw file bytes instead of session string
+    if category in (CATEGORY_TELEGRAM_SESSIONS, CATEGORY_TELEGRAM_OLD):
         session_file_data: Optional[bytes] = data.get("session_file_data")
         if not session_file_data:
             await message.answer(
@@ -4723,7 +4757,7 @@ async def fsm_add_twofa_password(message: Message, state: FSMContext) -> None:
     year = data.get("year")
     year_line = f"📅 Year: <b>{year}</b>\n" if year else ""
     twofa_line = "🔐 2FA: ✅ Set\n" if twofa_enc else ""
-    sess_icon = "📄 .session File: ✅ Uploaded\n" if category == CATEGORY_TELEGRAM_SESSIONS else "🔐 Session: ✅ Configured\n"
+    sess_icon = "📄 .session File: ✅ Uploaded\n" if category in (CATEGORY_TELEGRAM_SESSIONS, CATEGORY_TELEGRAM_OLD) else "🔐 Session: ✅ Configured\n"
     await state.clear()
     await message.answer(
         f"✅ <b>Number Added Successfully!</b>\n\n"
