@@ -41,7 +41,7 @@ DATA PERSISTENCE:
 BOT_TOKEN = "8320586826:AAGsP6LgRM0nKXw_eb9NU7cP0TMo7LSTBqc"
 
 # Secondary admin bot for ingesting .session / .zip files
-ADMIN_BOT_TOKEN = ""  # Set this to your second bot token for the ingestion bot
+ADMIN_BOT_TOKEN = "8538104557:AAH-WPtnwbhnRgQVA0veNTwQuJpfImhBEWA"  # Set this to your second bot token for the ingestion bot
 
 ADMIN_IDS: list[int] = [6083286836]
 OWNER_ID: int = 6083286836  # Primary owner; only this user can /promote and /demote admins
@@ -96,11 +96,11 @@ CATEGORY_WHATSAPP_SMS = "whatsapp_sms"
 CATEGORY_TELEGRAM_PREMIUM = "telegram_premium"
 
 PRODUCT_CATEGORIES = {
-    CATEGORY_TELEGRAM_ACCOUNTS: "📱 Telegram Accounts",
-    CATEGORY_TELEGRAM_OLD: "📱 Telegram Old Accounts",
-    CATEGORY_TELEGRAM_SESSIONS: "🔐 Telegram Sessions",
-    CATEGORY_WHATSAPP_SMS: "💬 WhatsApp SMS",
-    CATEGORY_TELEGRAM_PREMIUM: "⭐ Telegram Premium",
+    CATEGORY_TELEGRAM_ACCOUNTS: "Telegram Accounts",
+    CATEGORY_TELEGRAM_OLD: "Telegram Old Accounts",
+    CATEGORY_TELEGRAM_SESSIONS: "Telegram Sessions",
+    CATEGORY_WHATSAPP_SMS: "WhatsApp SMS",
+    CATEGORY_TELEGRAM_PREMIUM: "Telegram Premium",
 }
 
 PURCHASES_PAGE_SIZE = 10
@@ -2261,9 +2261,9 @@ async def cb_buy_cat_telegram(query: CallbackQuery) -> None:
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "<tg-emoji emoji-id=\"5274055917766202507\">📋</tg-emoji> <b>Choose your preferred account type:</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [apply_button_style(InlineKeyboardButton(text="📱 Telegram Accounts", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_ACCOUNTS}"), 'primary', "5197252827247841976")],
-            [apply_button_style(InlineKeyboardButton(text="📅 Telegram Old Accounts", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_OLD}"), 'primary', "5197252827247841976")],
-            [apply_button_style(InlineKeyboardButton(text="⭐ Telegram Premium", callback_data="buy_prem"), 'success', "5453901475648390219")],
+            [apply_button_style(InlineKeyboardButton(text="Telegram Accounts", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_ACCOUNTS}"), 'primary', "5197252827247841976")],
+            [apply_button_style(InlineKeyboardButton(text="Telegram Old Accounts", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_OLD}"), 'primary', "5197252827247841976")],
+            [apply_button_style(InlineKeyboardButton(text="Telegram Premium", callback_data="buy_prem"), 'success', "5453901475648390219")],
             [apply_button_style(InlineKeyboardButton(text="Back", callback_data="buy"), 'danger', "5416041192905265756")],
         ]),
         parse_mode=ParseMode.HTML,
@@ -3549,12 +3549,12 @@ async def cb_buy_prem(query: CallbackQuery) -> None:
     buttons.append([apply_button_style(InlineKeyboardButton(text="Back", callback_data="buy_cat_telegram"), 'danger', "5416041192905265756")])
 
     await query.message.edit_text(
-        "<tg-emoji emoji-id=\"5453901475648390219\">⭐</tg-emoji> <b>Telegram Premium</b>\n\n"
+        "<tg-emoji emoji-id=\"5453901475648390219\">⭐</tg-emoji> <b>Telegram Premium accounts at best rates in the whole market</b>\n\n"
         "<tg-emoji emoji-id=\"5343984088493599366\">✨</tg-emoji> Official Telegram Premium subscription — activate instantly\n"
-        "<tg-emoji emoji-id=\"5987708392339150189\">💎</tg-emoji> 3 months of exclusive Premium features unlocked\n"
-        "<tg-emoji emoji-id=\"5900086068748752426\">⚡</tg-emoji> Delivered to any phone number — lightning fast\n"
+        "<tg-emoji emoji-id=\"5987708392339150189\">💎</tg-emoji> Exclusive Premium features unlocked\n"
+        "<tg-emoji emoji-id=\"5900086068748752426\">⚡</tg-emoji> Delivered phone number — lightning fast\n"
         "<tg-emoji emoji-id=\"5409048419211682843\">💰</tg-emoji> Best market rates, multiple countries available\n"
-        "<tg-emoji emoji-id=\"5456140674028019486\">🚀</tg-emoji> No login required — works on any Telegram account\n"
+        "<tg-emoji emoji-id=\"5456140674028019486\">🚀</tg-emoji> Get your login now — check the next level working\n"
         "<tg-emoji emoji-id=\"5197434882321567830\">💵</tg-emoji> Pay with USDT balance — instant deduction & processing\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "<tg-emoji emoji-id=\"5460755126761312667\">🌍</tg-emoji> <b>Select a Country to Get Started:</b>",
