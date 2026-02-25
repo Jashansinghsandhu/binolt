@@ -1313,8 +1313,7 @@ class AdminAddPremiumCountry(StatesGroup):
 
 
 class AdminFulfillPremiumOrder(StatesGroup):
-    phone          = State()
-    session_string = State()
+    session_file   = State()
     twofa_password = State()
 
 
@@ -3269,19 +3268,13 @@ async def cb_buy_prem(query: CallbackQuery) -> None:
         return
 
     buttons = []
-    row_p: list[InlineKeyboardButton] = []
     for c in countries:
         flag = get_country_flag(c.country)
         btn = apply_button_style(InlineKeyboardButton(
             text=f"{flag} {c.country.title()} — ${float(c.price):.2f}",
             callback_data=f"buy_prem_ctry_{c.id}",
         ), 'primary', "5453901475648390219")
-        row_p.append(btn)
-        if len(row_p) == 2:
-            buttons.append(row_p)
-            row_p = []
-    if row_p:
-        buttons.append(row_p)
+        buttons.append([btn])
     buttons.append([apply_button_style(InlineKeyboardButton(text="Back", callback_data="buy_cat_telegram"), 'danger', "5416041192905265756")])
 
     await query.message.edit_text(
@@ -3462,33 +3455,47 @@ async def cb_prem_admin_confirm(query: CallbackQuery, state: FSMContext) -> None
     """Admin confirms a premium order - starts fulfillment FSM."""
     await query.answer()
     order_ref = query.data.replace("prem_admin_confirm_", "")
-    await state.set_state(AdminFulfillPremiumOrder.phone)
+    await state.set_state(AdminFulfillPremiumOrder.session_file)
     await state.update_data(prem_order_ref=order_ref)
     await query.message.answer(
         f"📌 Fulfilling Premium Order <code>{order_ref}</code>\n\n"
-        f"Enter the <b>phone number</b> for this premium order:",
+        f"Upload the <b>.session file</b> for this order as a document.\n"
+        f"The file name should be <code>+phonenumber.session</code> (e.g. <code>+12345678900.session</code>).",
         parse_mode=ParseMode.HTML,
     )
 
 
-@router.message(AdminFulfillPremiumOrder.phone)
+@router.message(AdminFulfillPremiumOrder.session_file)
 @admin_only
-async def fsm_prem_fulfill_phone(message: Message, state: FSMContext) -> None:
-    await state.update_data(prem_phone=message.text.strip())
-    await state.set_state(AdminFulfillPremiumOrder.session_string)
-    await message.answer(
-        "Now paste the <b>Telethon session string</b>:",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@router.message(AdminFulfillPremiumOrder.session_string)
-@admin_only
-async def fsm_prem_fulfill_session(message: Message, state: FSMContext) -> None:
-    await state.update_data(prem_session=message.text.strip())
+async def fsm_prem_fulfill_session_file(message: Message, state: FSMContext) -> None:
+    """Handle .session file upload for premium order fulfillment."""
+    if not message.document:
+        await message.answer(
+            "❌ Please upload the <b>.session file</b> as a document attachment.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if not message.document.file_name or not message.document.file_name.lower().endswith(".session"):
+        await message.answer(
+            "❌ Invalid file type. Please upload a <b>.session</b> file.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    # Extract phone number from filename (e.g. "+12345678900.session" → "+12345678900")
+    phone = message.document.file_name[:-len(".session")]
+    try:
+        tg_file = await message.bot.get_file(message.document.file_id)
+        downloaded = await message.bot.download_file(tg_file.file_path)
+        file_bytes = downloaded.read() if hasattr(downloaded, "read") else bytes(downloaded)
+    except Exception as e:
+        log.error("Error downloading premium session file: %s", e)
+        await message.answer("❌ Failed to download the file. Please try again.", parse_mode=ParseMode.HTML)
+        return
+    await state.update_data(prem_phone=phone, prem_session_file=file_bytes)
     await state.set_state(AdminFulfillPremiumOrder.twofa_password)
     await message.answer(
-        "Does this account have a 2FA password? Enter it, or send <code>0</code> to skip:",
+        f"✅ Session file received for <code>{phone}</code>\n\n"
+        f"Does this account have a 2FA password? Enter it, or send <code>0</code> to skip:",
         parse_mode=ParseMode.HTML,
     )
 
@@ -3505,7 +3512,7 @@ async def fsm_prem_fulfill_twofa(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     order_ref = data["prem_order_ref"]
     phone = data["prem_phone"]
-    sess_str = data["prem_session"]
+    session_file_data = data["prem_session_file"]
     await state.clear()
 
     async with AsyncSessionFactory() as session:
@@ -3521,7 +3528,7 @@ async def fsm_prem_fulfill_twofa(message: Message, state: FSMContext) -> None:
             country=prem_order.country,
             phone_number=phone,
             price=prem_order.price,
-            session_string=sess_str,
+            session_file_data=session_file_data,
             twofa_password=twofa_enc,
             status="Sold",
         )
@@ -3533,7 +3540,6 @@ async def fsm_prem_fulfill_twofa(message: Message, state: FSMContext) -> None:
             update(PremiumOrder).where(PremiumOrder.order_ref == order_ref).values(
                 status="Completed",
                 phone_number=phone,
-                session_string=sess_str,
                 twofa_password=twofa_enc,
                 product_id=product.id,
             )
