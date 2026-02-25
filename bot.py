@@ -3268,23 +3268,31 @@ async def cb_buy_prem(query: CallbackQuery) -> None:
         return
 
     buttons = []
+    row_p: list[InlineKeyboardButton] = []
     for c in countries:
         flag = get_country_flag(c.country)
         btn = apply_button_style(InlineKeyboardButton(
             text=f"{flag} {c.country.title()} — ${float(c.price):.2f}",
             callback_data=f"buy_prem_ctry_{c.id}",
         ), 'primary', "5453901475648390219")
-        buttons.append([btn])
+        row_p.append(btn)
+        if len(row_p) == 2:
+            buttons.append(row_p)
+            row_p = []
+    if row_p:
+        buttons.append(row_p)
     buttons.append([apply_button_style(InlineKeyboardButton(text="Back", callback_data="buy_cat_telegram"), 'danger', "5416041192905265756")])
 
     await query.message.edit_text(
         "<tg-emoji emoji-id=\"5453901475648390219\">⭐</tg-emoji> <b>Telegram Premium</b>\n\n"
-        "<tg-emoji emoji-id=\"5343984088493599366\">✨</tg-emoji> Official Telegram Premium subscription\n"
-        "<tg-emoji emoji-id=\"5987708392339150189\">💎</tg-emoji> 3 months of exclusive Premium features\n"
-        "<tg-emoji emoji-id=\"5900086068748752426\">⚡</tg-emoji> Delivered to any phone number — fast\n"
-        "<tg-emoji emoji-id=\"5409048419211682843\">💰</tg-emoji> Best rates, multiple countries available\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "<tg-emoji emoji-id=\"5460755126761312667\">🌍</tg-emoji> <b>Select a Country:</b>",
+        "<tg-emoji emoji-id=\"5343984088493599366\">✨</tg-emoji> Official Telegram Premium subscription — activate instantly\n"
+        "<tg-emoji emoji-id=\"5987708392339150189\">💎</tg-emoji> 3 months of exclusive Premium features unlocked\n"
+        "<tg-emoji emoji-id=\"5900086068748752426\">⚡</tg-emoji> Delivered to any phone number — lightning fast\n"
+        "<tg-emoji emoji-id=\"5409048419211682843\">💰</tg-emoji> Best market rates, multiple countries available\n"
+        "<tg-emoji emoji-id=\"5456140674028019486\">🚀</tg-emoji> No login required — works on any Telegram account\n"
+        "<tg-emoji emoji-id=\"5197434882321567830\">💵</tg-emoji> Pay with USDT balance — instant deduction & processing\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<tg-emoji emoji-id=\"5460755126761312667\">🌍</tg-emoji> <b>Select a Country to Get Started:</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode=ParseMode.HTML,
     )
