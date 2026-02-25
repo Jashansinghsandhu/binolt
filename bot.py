@@ -68,7 +68,19 @@ BLOCKCHAIN_POLL_INTERVAL = 30
 OXAPAY_POLL_INTERVAL = 30  # Check OxaPay payments every 30 seconds
 GAS_BNB_AMOUNT = 0.001
 BNB_CONFIRMATION_WAIT_SECONDS = 5
-REFERRAL_COMMISSION_PCT = 1.5
+REFERRAL_COMMISSION_PCT = 0  # Set to 0 — new discount-based referral system replaces cash commission
+
+# ── Referral Discount Benefit Thresholds ────────────────────────────────────
+# Tier 1: Discount on purchases
+# User earns a discount when they invite enough referrals.
+REFERRAL_DISCOUNT_QUALIFIED_COUNT = 3   # qualified referrals needed (each made ≥1 deposit)
+REFERRAL_DISCOUNT_SIMPLE_COUNT    = 20  # OR simple referrals needed (no deposit required)
+REFERRAL_DISCOUNT_PCT             = 10  # % discount applied at checkout
+REFERRAL_DISCOUNT_PURCHASES       = 2   # number of purchases the discount applies to
+# Tier 2: Free purchase
+# User earns a completely free purchase from any stock item.
+REFERRAL_FREE_QUALIFIED_COUNT     = 10  # qualified referrals needed for a free purchase
+REFERRAL_FREE_SIMPLE_COUNT        = 50  # OR simple referrals needed for a free purchase
 SUPPORT_USERNAME = "jashanxjagy"  # Without @ prefix (added in URLs)
 LOG_CHANNEL = ""  # Add your channel username here (without @), e.g. "mychannel"
 FORCE_JOIN_CHANNEL = "agednews"  # Channel users must join before using the bot (without @)
@@ -395,6 +407,18 @@ class Settings(Base):
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class ReferralBenefit(Base):
+    """Tracks referral-based discount/free-purchase benefits per user (referrer)."""
+    __tablename__ = "referral_benefits"
+    id                       = Column(Integer, primary_key=True, autoincrement=True)
+    user_id                  = Column(BigInteger, nullable=False, unique=True)
+    discount_uses_remaining  = Column(Integer, default=0)   # discounted purchases remaining
+    free_purchases_remaining = Column(Integer, default=0)   # free purchases remaining
+    discount_granted         = Column(Boolean, default=False)  # has Tier-1 been granted?
+    free_granted             = Column(Boolean, default=False)  # has Tier-2 been granted?
+    updated_at               = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -418,6 +442,7 @@ async def init_db() -> None:
             "CREATE TABLE IF NOT EXISTS premium_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, order_ref VARCHAR(32) UNIQUE NOT NULL, user_id BIGINT NOT NULL, country VARCHAR(64) NOT NULL, price NUMERIC(18,6) NOT NULL, status VARCHAR(16) DEFAULT 'Pending', phone_number VARCHAR(32), session_string TEXT, twofa_password TEXT, product_id INTEGER, created_at DATETIME)",
             "ALTER TABLE products ADD COLUMN session_file_data BLOB",
             "CREATE TABLE IF NOT EXISTS settings (key VARCHAR(64) PRIMARY KEY, value TEXT, updated_at DATETIME)",
+            "CREATE TABLE IF NOT EXISTS referral_benefits (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id BIGINT NOT NULL UNIQUE, discount_uses_remaining INTEGER DEFAULT 0, free_purchases_remaining INTEGER DEFAULT 0, discount_granted BOOLEAN DEFAULT 0, free_granted BOOLEAN DEFAULT 0, updated_at DATETIME)",
         ]
         for migration in migrations:
             try:
@@ -745,9 +770,12 @@ def get_help_text() -> str:
         "• Gift codes add balance to your account instantly!\n"
         "• Check back regularly for special codes\n\n"
         "👥 <b>5. REFERRAL PROGRAM</b>\n"
-        f"• Earn {REFERRAL_COMMISSION_PCT}% on referral deposits\n"
-        "• Share your unique link\n"
-        "• Track earnings in Referral section\n\n"
+        f"• Invite {REFERRAL_DISCOUNT_QUALIFIED_COUNT} qualified (or {REFERRAL_DISCOUNT_SIMPLE_COUNT} simple) referrals\n"
+        f"  → Unlock <b>{REFERRAL_DISCOUNT_PCT}% discount</b> for your next {REFERRAL_DISCOUNT_PURCHASES} purchases!\n"
+        f"• Invite {REFERRAL_FREE_QUALIFIED_COUNT} qualified (or {REFERRAL_FREE_SIMPLE_COUNT} simple) referrals\n"
+        f"  → Earn <b>1 FREE purchase</b> from any stock!\n"
+        "• Share your unique link from the Referral menu\n"
+        "• Tap ✨ Check Benefits to track your progress\n\n"
         "<tg-emoji emoji-id='5319175438268913255'>👤</tg-emoji> <b>6. PROFILE</b>\n"
         "• View your complete statistics\n"
         "• Check purchase history\n"
@@ -2084,19 +2112,22 @@ async def _process_oxapay_confirmation(payment: OxaPayPayment, data: dict) -> No
                 * Decimal(str(REFERRAL_COMMISSION_PCT))
                 / Decimal(100)
             )
-            await session.execute(
-                update(User)
-                .where(User.id == user.referred_by)
-                .values(balance=User.balance + commission)
-            )
-            ref_txn = Transaction(
-                user_id=user.referred_by,
-                type="ReferralBonus",
-                amount=commission,
-                tx_hash=payment.track_id,
-                status="Completed",
-            )
-            session.add(ref_txn)
+            if commission > 0:
+                await session.execute(
+                    update(User)
+                    .where(User.id == user.referred_by)
+                    .values(balance=User.balance + commission)
+                )
+                ref_txn = Transaction(
+                    user_id=user.referred_by,
+                    type="ReferralBonus",
+                    amount=commission,
+                    tx_hash=payment.track_id,
+                    status="Completed",
+                )
+                session.add(ref_txn)
+            # Update referral benefit thresholds for the referrer
+            await update_referral_benefits(session, user.referred_by)
         
         await session.commit()
 
@@ -2146,15 +2177,31 @@ async def oxapay_webhook_handler(request: web.Request) -> web.Response:
 async def get_applicable_discount(session: AsyncSession, user_id: int, total_deposited: Decimal) -> Decimal:
     """
     Returns the applicable discount percentage for a user.
-    Checks user-specific discount first, then global tiers.
+    Priority: referral free purchase (100%) > referral discount > deposit-based discounts.
     """
+    # ── Referral benefits (highest priority) ─────────────────────────────────
+    ref_res = await session.execute(
+        select(ReferralBenefit).where(ReferralBenefit.user_id == user_id)
+    )
+    ref_benefit = ref_res.scalar_one_or_none()
+    if ref_benefit:
+        if ref_benefit.free_purchases_remaining > 0:
+            return Decimal("100")  # completely free purchase
+        if ref_benefit.discount_uses_remaining > 0:
+            ref_disc = Decimal(str(REFERRAL_DISCOUNT_PCT))
+        else:
+            ref_disc = Decimal("0")
+    else:
+        ref_disc = Decimal("0")
+
+    # ── Deposit-based discounts ───────────────────────────────────────────────
     # Check user-specific discount first
     user_disc_res = await session.execute(
         select(UserDiscount).where(UserDiscount.user_id == user_id)
     )
     user_disc = user_disc_res.scalar_one_or_none()
     if user_disc is not None and total_deposited >= Decimal(str(user_disc.min_deposit)):
-        return Decimal(str(user_disc.discount_pct))
+        return max(Decimal(str(user_disc.discount_pct)), ref_disc)
 
     # Check global tiers - return highest applicable discount
     tiers_res = await session.execute(
@@ -2163,9 +2210,120 @@ async def get_applicable_discount(session: AsyncSession, user_id: int, total_dep
     tiers = tiers_res.scalars().all()
     for tier in tiers:
         if total_deposited >= Decimal(str(tier.min_deposit)):
-            return Decimal(str(tier.discount_pct))
+            return max(Decimal(str(tier.discount_pct)), ref_disc)
 
-    return Decimal("0")
+    return ref_disc
+
+
+async def update_referral_benefits(session: AsyncSession, referrer_id: int) -> None:
+    """Check if referrer has crossed any referral benefit thresholds and grant new benefits.
+
+    Called whenever one of the referrer's referrals makes a qualifying deposit.
+    This function is idempotent — already-granted tiers are never re-granted.
+    """
+    # Count all users referred by referrer_id
+    all_refs_res = await session.execute(
+        select(User).where(User.referred_by == referrer_id)
+    )
+    all_refs = all_refs_res.scalars().all()
+    simple_count = len(all_refs)
+
+    # Qualified = referred users who made at least one successful deposit
+    qualified_count = 0
+    for ref_user in all_refs:
+        dep_res = await session.execute(
+            select(Transaction.id).where(
+                Transaction.user_id == ref_user.id,
+                Transaction.type.in_(["Deposit", "OxaPayDeposit"]),
+                Transaction.status == "Completed",
+            ).limit(1)
+        )
+        if dep_res.scalar_one_or_none() is not None:
+            qualified_count += 1
+
+    qualifies_discount = (
+        qualified_count >= REFERRAL_DISCOUNT_QUALIFIED_COUNT
+        or simple_count >= REFERRAL_DISCOUNT_SIMPLE_COUNT
+    )
+    qualifies_free = (
+        qualified_count >= REFERRAL_FREE_QUALIFIED_COUNT
+        or simple_count >= REFERRAL_FREE_SIMPLE_COUNT
+    )
+
+    res = await session.execute(
+        select(ReferralBenefit).where(ReferralBenefit.user_id == referrer_id)
+    )
+    benefit = res.scalar_one_or_none()
+
+    if benefit is None:
+        # Create record if any threshold is met
+        if qualifies_free:
+            session.add(ReferralBenefit(
+                user_id=referrer_id,
+                discount_uses_remaining=0,
+                free_purchases_remaining=1,
+                discount_granted=True,
+                free_granted=True,
+                updated_at=datetime.now(timezone.utc),
+            ))
+        elif qualifies_discount:
+            session.add(ReferralBenefit(
+                user_id=referrer_id,
+                discount_uses_remaining=REFERRAL_DISCOUNT_PURCHASES,
+                free_purchases_remaining=0,
+                discount_granted=True,
+                free_granted=False,
+                updated_at=datetime.now(timezone.utc),
+            ))
+    else:
+        changes: dict = {}
+        if qualifies_free and not benefit.free_granted:
+            changes["free_purchases_remaining"] = benefit.free_purchases_remaining + 1
+            changes["free_granted"] = True
+        if qualifies_discount and not benefit.discount_granted:
+            changes["discount_uses_remaining"] = (
+                benefit.discount_uses_remaining + REFERRAL_DISCOUNT_PURCHASES
+            )
+            changes["discount_granted"] = True
+        if changes:
+            changes["updated_at"] = datetime.now(timezone.utc)
+            await session.execute(
+                update(ReferralBenefit)
+                .where(ReferralBenefit.user_id == referrer_id)
+                .values(**changes)
+            )
+    await session.flush()
+
+
+async def consume_purchase_benefit(session: AsyncSession, user_id: int, disc_pct: Decimal) -> None:
+    """Decrement the referral benefit counter that was consumed in this purchase."""
+    if disc_pct <= 0:
+        return
+    res = await session.execute(
+        select(ReferralBenefit).where(ReferralBenefit.user_id == user_id)
+    )
+    benefit = res.scalar_one_or_none()
+    if benefit is None:
+        return
+    if disc_pct >= 100 and benefit.free_purchases_remaining > 0:
+        await session.execute(
+            update(ReferralBenefit)
+            .where(ReferralBenefit.user_id == user_id)
+            .values(
+                free_purchases_remaining=benefit.free_purchases_remaining - 1,
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+    elif benefit.discount_uses_remaining > 0:
+        await session.execute(
+            update(ReferralBenefit)
+            .where(ReferralBenefit.user_id == user_id)
+            .values(
+                discount_uses_remaining=benefit.discount_uses_remaining - 1,
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+    await session.flush()
 
 
 async def post_to_log_channel(bot: Bot, user_display: str, category: str, country: str, price: Decimal, phone_number: str, discount_pct: Decimal = Decimal("0"), user_id: Optional[int] = None, total_deposited: Decimal = Decimal("0")) -> None:
@@ -2686,7 +2844,7 @@ async def cb_buy_confirm(query: CallbackQuery) -> None:
     can_afford = user_balance >= total_cost
     flag = get_country_flag(country)
 
-    disc_note = f" ({disc_pct:.0f}% off)" if disc_pct > 0 else ""
+    disc_note = " (FREE — referral benefit!)" if disc_pct >= 100 else (f" ({disc_pct:.0f}% off)" if disc_pct > 0 else "")
 
     if can_afford:
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -2847,6 +3005,11 @@ async def cb_buy_execute(query: CallbackQuery) -> None:
 
         await session.commit()
 
+    # Consume referral benefit if applicable
+    async with AsyncSessionFactory() as ben_session:
+        await consume_purchase_benefit(ben_session, user_id, disc_pct)
+        await ben_session.commit()
+
     # Clear stale OTPs and start listeners
     for item in purchased_items:
         pid = item["pid"]
@@ -2870,7 +3033,11 @@ async def cb_buy_execute(query: CallbackQuery) -> None:
     for item in purchased_items:
         await post_to_log_channel(query.bot, user_display, category, country, actual_price, item["phone"], disc_pct, user_id=user_id, total_deposited=_total_dep)
 
-    disc_line = f"<tg-emoji emoji-id=\"5240228673738527951\">🏷️</tg-emoji> <b>Discount:</b> {disc_pct:.0f}% off\n" if disc_pct > 0 else ""
+    disc_line = (
+        '<tg-emoji emoji-id="5461151367559141950">🎁</tg-emoji> <b>FREE purchase (referral benefit)!</b>\n'
+        if disc_pct >= 100 else
+        (f'<tg-emoji emoji-id="5240228673738527951">🏷️</tg-emoji> <b>Discount:</b> {disc_pct:.0f}% off\n' if disc_pct > 0 else "")
+    )
     flag = get_country_flag(country)
 
     if qty == 1:
@@ -3410,6 +3577,11 @@ async def cb_tgold_execute(query: CallbackQuery) -> None:
             })
         await session.commit()
 
+    # Consume referral benefit if applicable
+    async with AsyncSessionFactory() as ben_session:
+        await consume_purchase_benefit(ben_session, user_id, disc_pct)
+        await ben_session.commit()
+
     # Clear stale OTPs and start listeners
     for item in purchased_items:
         pid = item["pid"]
@@ -3432,7 +3604,11 @@ async def cb_tgold_execute(query: CallbackQuery) -> None:
         await post_to_log_channel(query.bot, user_display, CATEGORY_TELEGRAM_OLD, country, actual_price, item["phone"], disc_pct, user_id=user_id, total_deposited=_total_dep)
 
     flag = get_country_flag(country)
-    disc_line = f"<tg-emoji emoji-id=\"5240228673738527951\">🏷️</tg-emoji> <b>Discount:</b> {disc_pct:.0f}% off\n" if disc_pct > 0 else ""
+    disc_line = (
+        '<tg-emoji emoji-id="5461151367559141950">🎁</tg-emoji> <b>FREE purchase (referral benefit)!</b>\n'
+        if disc_pct >= 100 else
+        (f'<tg-emoji emoji-id="5240228673738527951">🏷️</tg-emoji> <b>Discount:</b> {disc_pct:.0f}% off\n' if disc_pct > 0 else "")
+    )
 
     if qty == 1:
         item = purchased_items[0]
@@ -4222,6 +4398,11 @@ async def cb_buynow_execute(query: CallbackQuery) -> None:
         pid = p.id
         p_category = p.category
 
+    # Consume referral benefit if applicable
+    async with AsyncSessionFactory() as ben_session:
+        await consume_purchase_benefit(ben_session, user_id, disc_pct)
+        await ben_session.commit()
+
     # Clear any stale OTP from previous ownership
     async with AsyncSessionFactory() as session:
         await session.execute(
@@ -4251,7 +4432,11 @@ async def cb_buynow_execute(query: CallbackQuery) -> None:
         except Exception:
             pass
 
-    disc_line = f"<tg-emoji emoji-id=\"5240228673738527951\">🏷️</tg-emoji> <b>Discount:</b> {disc_pct:.0f}% off\n" if disc_pct > 0 else ""
+    disc_line = (
+        '<tg-emoji emoji-id="5461151367559141950">🎁</tg-emoji> <b>FREE purchase (referral benefit)!</b>\n'
+        if disc_pct >= 100 else
+        (f'<tg-emoji emoji-id="5240228673738527951">🏷️</tg-emoji> <b>Discount:</b> {disc_pct:.0f}% off\n' if disc_pct > 0 else "")
+    )
 
     if p_category == CATEGORY_TELEGRAM_SESSIONS:
         session_line = "<tg-emoji emoji-id=\"5197252827247841976\">📄</tg-emoji> Your .session file is attached above.\n"
@@ -4426,27 +4611,141 @@ async def cb_referral(query: CallbackQuery) -> None:
     async with AsyncSessionFactory() as session:
         result = await session.execute(select(User).where(User.referred_by == user_id))
         referred_users = result.scalars().all()
-        result2 = await session.execute(
-            select(Transaction).where(
-                Transaction.user_id == user_id,
-                Transaction.type == "ReferralBonus",
-            )
-        )
-        bonuses = result2.scalars().all()
-        total_earned = sum(Decimal(str(b.amount)) for b in bonuses)
 
+        # Count qualified referrals (those who made at least one deposit)
+        qualified_count = 0
+        for ref_user in referred_users:
+            dep_res = await session.execute(
+                select(Transaction.id).where(
+                    Transaction.user_id == ref_user.id,
+                    Transaction.type.in_(["Deposit", "OxaPayDeposit"]),
+                    Transaction.status == "Completed",
+                ).limit(1)
+            )
+            if dep_res.scalar_one_or_none() is not None:
+                qualified_count += 1
+
+        # Also refresh benefits in case they haven't been updated yet
+        await update_referral_benefits(session, user_id)
+        await session.commit()
+
+        benefit_res = await session.execute(
+            select(ReferralBenefit).where(ReferralBenefit.user_id == user_id)
+        )
+        benefit = benefit_res.scalar_one_or_none()
+
+    simple_count = len(referred_users)
     bot_info = await query.bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
 
+    disc_uses = benefit.discount_uses_remaining if benefit else 0
+    free_uses = benefit.free_purchases_remaining if benefit else 0
+
+    benefit_summary = ""
+    if free_uses > 0:
+        benefit_summary = (
+            f"\n<tg-emoji emoji-id=\"5461151367559141950\">🎁</tg-emoji> "
+            f"<b>Free purchases available:</b> {free_uses}\n"
+        )
+    elif disc_uses > 0:
+        benefit_summary = (
+            f"\n<tg-emoji emoji-id=\"5427168083074628963\">🏷️</tg-emoji> "
+            f"<b>Discounted purchases available:</b> {disc_uses} × {REFERRAL_DISCOUNT_PCT}% off\n"
+        )
+
     await query.message.edit_text(
         f"<tg-emoji emoji-id=\"5253576920993388584\">🤝</tg-emoji> <b>Your Referral Program</b>\n\n"
-        f"<tg-emoji emoji-id=\"5305265301917549162\">🔗</tg-emoji> Your link:\n<code>{ref_link}</code>\n\n"
-        f"<tg-emoji emoji-id=\"5319175438268913255\">👥</tg-emoji> Total referrals: <b>{len(referred_users)}</b>\n"
-        f"<tg-emoji emoji-id=\"5409048419211682843\">💵</tg-emoji> Total earned: <b>${total_earned:.2f} USDT</b>\n\n"
-        f"Earn <b>{REFERRAL_COMMISSION_PCT}%</b> commission on every deposit "
-        f"made by your referrals!",
+        f"<tg-emoji emoji-id=\"5305265301917549162\">🔗</tg-emoji> <b>Your link:</b>\n<code>{ref_link}</code>\n\n"
+        f"<tg-emoji emoji-id=\"5319175438268913255\">👥</tg-emoji> <b>Total referrals:</b> {simple_count} "
+        f"(<b>{qualified_count}</b> qualified)\n"
+        f"{benefit_summary}\n"
+        f"<i>Invite friends to unlock exclusive discounts &amp; free purchases!</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [apply_button_style(
+                InlineKeyboardButton(
+                    text="✨ Check Benefits",
+                    callback_data="referral_benefits",
+                ), 'primary', "5343984088493599366",
+            )],
+            [apply_button_style(InlineKeyboardButton(text="Back", callback_data="back_main"), 'danger', "5416041192905265756")],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(F.data == "referral_benefits")
+async def cb_referral_benefits(query: CallbackQuery) -> None:
+    """Show referral benefit thresholds and the user's current progress."""
+    await query.answer()
+    user_id = query.from_user.id
+    async with AsyncSessionFactory() as session:
+        result = await session.execute(select(User).where(User.referred_by == user_id))
+        referred_users = result.scalars().all()
+
+        qualified_count = 0
+        for ref_user in referred_users:
+            dep_res = await session.execute(
+                select(Transaction.id).where(
+                    Transaction.user_id == ref_user.id,
+                    Transaction.type.in_(["Deposit", "OxaPayDeposit"]),
+                    Transaction.status == "Completed",
+                ).limit(1)
+            )
+            if dep_res.scalar_one_or_none() is not None:
+                qualified_count += 1
+
+        benefit_res = await session.execute(
+            select(ReferralBenefit).where(ReferralBenefit.user_id == user_id)
+        )
+        benefit = benefit_res.scalar_one_or_none()
+
+    simple_count = len(referred_users)
+    disc_uses = benefit.discount_uses_remaining if benefit else 0
+    free_uses = benefit.free_purchases_remaining if benefit else 0
+
+    def _progress_bar(current: int, target: int, length: int = 10) -> str:
+        filled = min(int(length * current / target), length) if target > 0 else length
+        return "▓" * filled + "░" * (length - filled)
+
+    # Tier-1 progress
+    q1_pct = min(qualified_count / REFERRAL_DISCOUNT_QUALIFIED_COUNT * 100, 100)
+    s1_pct = min(simple_count / REFERRAL_DISCOUNT_SIMPLE_COUNT * 100, 100)
+    tier1_done = "✅" if (benefit and benefit.discount_granted) else "🔒"
+    tier1_bar_q = _progress_bar(qualified_count, REFERRAL_DISCOUNT_QUALIFIED_COUNT)
+    tier1_bar_s = _progress_bar(simple_count, REFERRAL_DISCOUNT_SIMPLE_COUNT)
+
+    # Tier-2 progress
+    tier2_done = "✅" if (benefit and benefit.free_granted) else "🔒"
+    tier2_bar_q = _progress_bar(qualified_count, REFERRAL_FREE_QUALIFIED_COUNT)
+    tier2_bar_s = _progress_bar(simple_count, REFERRAL_FREE_SIMPLE_COUNT)
+
+    active_section = ""
+    if disc_uses > 0:
+        active_section += (
+            f"\n<tg-emoji emoji-id=\"5427168083074628963\">🏷️</tg-emoji> "
+            f"<b>Active: {disc_uses} discounted purchase(s) remaining</b> ({REFERRAL_DISCOUNT_PCT}% off)\n"
+        )
+    if free_uses > 0:
+        active_section += (
+            f"\n<tg-emoji emoji-id=\"5461151367559141950\">🎁</tg-emoji> "
+            f"<b>Active: {free_uses} FREE purchase(s) remaining</b>\n"
+        )
+
+    await query.message.edit_text(
+        f"<tg-emoji emoji-id=\"5343984088493599366\">✨</tg-emoji> <b>Referral Benefits</b>\n\n"
+        f"<b>Your stats:</b> {simple_count} total referrals · {qualified_count} qualified\n"
+        f"{active_section}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{tier1_done} <b>Tier 1 — {REFERRAL_DISCOUNT_PCT}% Discount</b> ({REFERRAL_DISCOUNT_PURCHASES}× uses)\n"
+        f"  Qualified: {tier1_bar_q} {qualified_count}/{REFERRAL_DISCOUNT_QUALIFIED_COUNT}\n"
+        f"  <i>or</i> Simple: {tier1_bar_s} {simple_count}/{REFERRAL_DISCOUNT_SIMPLE_COUNT}\n\n"
+        f"{tier2_done} <b>Tier 2 — 1 FREE Purchase</b>\n"
+        f"  Qualified: {tier2_bar_q} {qualified_count}/{REFERRAL_FREE_QUALIFIED_COUNT}\n"
+        f"  <i>or</i> Simple: {tier2_bar_s} {simple_count}/{REFERRAL_FREE_SIMPLE_COUNT}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>Qualified = referred user who made at least 1 deposit.</i>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            apply_button_style(InlineKeyboardButton(text="Back", callback_data="back_main"), 'danger', "5416041192905265756"),
+            apply_button_style(InlineKeyboardButton(text="Back", callback_data="referral"), 'danger', "5416041192905265756"),
         ]]),
         parse_mode=ParseMode.HTML,
     )
@@ -5829,7 +6128,8 @@ async def cmd_help(message: Message) -> None:
         "/admin – Open the Admin Panel\n"
         "/tip @username amount – Add balance to a user\n"
         "/setbal @username amount – Set exact balance for a user\n"
-        "/remove +phonenumber – Delete a number and all its data\n"
+        "/remove – Remove numbers from inventory (use alone to see full guide)\n"
+        "/listall – List all numbers currently in the database\n"
         "/help – Show this help message\n\n"
         "<b>Admin Panel Features:</b>\n"
         "➕ <b>Add Number</b> – Add a new virtual number to inventory\n"
@@ -5845,7 +6145,8 @@ async def cmd_help(message: Message) -> None:
         "<b>Notes:</b>\n"
         "• /setbal can use @username or numeric Telegram ID\n"
         "• /tip adds to existing balance; /setbal sets exact amount\n"
-        "• /remove permanently deletes the number and its session string",
+        "• /remove supports categories (ta/ts/tp/toa), countries, years &amp; specific numbers\n"
+        "• /listall can be long — bot splits into multiple messages automatically",
         parse_mode=ParseMode.HTML,
     )
 
@@ -5911,57 +6212,311 @@ async def cmd_orders(message: Message) -> None:
 @router.message(Command("remove"))
 @admin_only
 async def cmd_remove(message: Message) -> None:
-    """Delete a phone number and all associated data from the bot."""
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer(
-            "❌ Usage: <code>/remove +phonenumber</code>\n"
-            "Example: <code>/remove +919876543210</code>",
-            parse_mode=ParseMode.HTML,
-        )
+    """Advanced remove command — delete categories, countries, or specific numbers."""
+    raw_parts = message.text.split()[1:]  # drop "/remove"
+
+    REMOVE_USAGE = (
+        "🔐 <b>/remove — Usage Guide</b>\n\n"
+        "<b>Remove entire country from a category:</b>\n"
+        "  <code>/remove ta &lt;country&gt;</code>  — Telegram Accounts\n"
+        "  <code>/remove ts &lt;country&gt;</code>  — Telegram Sessions\n"
+        "  <code>/remove tp &lt;country&gt;</code>  — Telegram Premium\n\n"
+        "<b>Remove old account country by year:</b>\n"
+        "  <code>/remove toa &lt;year&gt; &lt;country&gt;</code>\n"
+        "  <code>/remove toa &lt;year&gt;</code>  — Remove entire year\n\n"
+        "<b>Remove specific numbers (up to 10):</b>\n"
+        "  <code>/remove ta &lt;country&gt; +num1 +num2 …</code>\n"
+        "  <code>/remove ts &lt;country&gt; +num1 +num2 …</code>\n"
+        "  <code>/remove tp &lt;country&gt; +num1 +num2 …</code>\n"
+        "  <code>/remove toa &lt;year&gt; &lt;country&gt; +num1 +num2 …</code>\n\n"
+        "<b>Abbreviations:</b> ta=Telegram Accounts, ts=Telegram Sessions,\n"
+        "  tp=Telegram Premium, toa=Telegram Old Accounts\n\n"
+        "<i>Numbers must start with + or be digits only.</i>"
+    )
+
+    if not raw_parts:
+        await message.answer(REMOVE_USAGE, parse_mode=ParseMode.HTML)
         return
 
-    phone_number = parts[1].strip()
+    subcmd = raw_parts[0].lower()
 
-    async with AsyncSessionFactory() as session:
-        result = await session.execute(
-            select(Product).where(Product.phone_number == phone_number)
-        )
-        product = result.scalar_one_or_none()
+    # ── Category map ──────────────────────────────────────────────────────────
+    CAT_MAP = {
+        "ta": CATEGORY_TELEGRAM_ACCOUNTS,
+        "ts": CATEGORY_TELEGRAM_SESSIONS,
+        "tp": CATEGORY_TELEGRAM_PREMIUM,
+    }
 
-        if product is None:
+    def _is_number(s: str) -> bool:
+        """Return True if the token looks like a phone number."""
+        return s.startswith("+") or s.lstrip("+").isdigit()
+
+    async def _delete_products(products: list) -> int:
+        """Delete products and their orders/transactions from the DB.
+        Returns count deleted."""
+        count = 0
+        async with AsyncSessionFactory() as session:
+            for p in products:
+                pid = p.id
+                ord_rows = await session.execute(select(Order).where(Order.product_id == pid))
+                for order in ord_rows.scalars().all():
+                    await session.execute(delete(Transaction).where(Transaction.order_id == order.id))
+                await session.execute(delete(Order).where(Order.product_id == pid))
+                await session.execute(delete(Product).where(Product.id == pid))
+                count += 1
+            await session.commit()
+        # Stop OTP listeners
+        for p in products:
+            await otp_manager.stop_product(p.id)
+        return count
+
+    # ── ta / ts / tp ──────────────────────────────────────────────────────────
+    if subcmd in CAT_MAP:
+        category = CAT_MAP[subcmd]
+        remaining = raw_parts[1:]
+        if not remaining:
+            await message.answer(REMOVE_USAGE, parse_mode=ParseMode.HTML)
+            return
+
+        # Split remaining into country tokens and number tokens
+        number_tokens: list[str] = []
+        country_tokens: list[str] = []
+        for token in remaining:
+            if _is_number(token):
+                number_tokens.append(token)
+            else:
+                if number_tokens:
+                    # numbers started already; this shouldn't happen but skip
+                    break
+                country_tokens.append(token)
+
+        country = " ".join(country_tokens).lower().strip()
+        if not country:
+            await message.answer(REMOVE_USAGE, parse_mode=ParseMode.HTML)
+            return
+
+        numbers = number_tokens[:10]  # max 10
+
+        async with AsyncSessionFactory() as session:
+            if numbers:
+                rows = await session.execute(
+                    select(Product).where(
+                        Product.category == category,
+                        Product.country == country,
+                        Product.phone_number.in_(numbers),
+                    )
+                )
+            else:
+                rows = await session.execute(
+                    select(Product).where(
+                        Product.category == category,
+                        Product.country == country,
+                    )
+                )
+            products = rows.scalars().all()
+
+        if not products:
+            flag = get_country_flag(country)
             await message.answer(
-                f"❌ Number <code>{phone_number}</code> not found in the database.",
+                f"❌ No numbers found for {flag} <b>{country.title()}</b> "
+                f"in <b>{PRODUCT_CATEGORIES.get(category, category)}</b>.",
                 parse_mode=ParseMode.HTML,
             )
             return
 
-        pid = product.id
-
-        # Remove associated orders and their transactions
-        ord_rows = await session.execute(
-            select(Order).where(Order.product_id == pid)
+        count = await _delete_products(list(products))
+        flag = get_country_flag(country)
+        cat_name = PRODUCT_CATEGORIES.get(category, category)
+        await message.answer(
+            f"✅ <b>Removed {count} number(s)</b>\n\n"
+            f"📁 Category: <b>{cat_name}</b>\n"
+            f"🌍 Country: {flag} <b>{country.title()}</b>\n"
+            f"🗑 All session files, orders &amp; transactions deleted.",
+            parse_mode=ParseMode.HTML,
         )
-        orders = ord_rows.scalars().all()
-        for order in orders:
-            await session.execute(
-                delete(Transaction).where(Transaction.order_id == order.id)
+        return
+
+    # ── toa ───────────────────────────────────────────────────────────────────
+    if subcmd == "toa":
+        remaining = raw_parts[1:]
+        if not remaining:
+            await message.answer(REMOVE_USAGE, parse_mode=ParseMode.HTML)
+            return
+
+        try:
+            year = int(remaining[0])
+        except ValueError:
+            await message.answer(
+                "❌ Year must be a number, e.g. <code>2018</code>.",
+                parse_mode=ParseMode.HTML,
             )
-        await session.execute(delete(Order).where(Order.product_id == pid))
+            return
 
-        # Delete the product (session_string is stored in the product row)
-        await session.execute(delete(Product).where(Product.id == pid))
-        await session.commit()
+        rest = remaining[1:]
 
-    # Stop any running OTP listener for this product
-    await otp_manager.stop_product(pid)
+        # /remove toa year  (no country)
+        if not rest:
+            async with AsyncSessionFactory() as session:
+                rows = await session.execute(
+                    select(Product).where(
+                        Product.category == CATEGORY_TELEGRAM_OLD,
+                        Product.year == year,
+                    )
+                )
+                products = rows.scalars().all()
 
-    await message.answer(
-        f"✅ <b>Number Removed</b>\n\n"
-        f"📱 <code>{phone_number}</code> and all associated data "
-        f"(session string, orders, transactions) have been permanently deleted.",
-        parse_mode=ParseMode.HTML,
-    )
+            if not products:
+                await message.answer(
+                    f"❌ No numbers found for year <b>{year}</b>.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
+            count = await _delete_products(list(products))
+            await message.answer(
+                f"✅ <b>Removed {count} number(s)</b>\n\n"
+                f"📅 Year: <b>{year}</b>\n"
+                f"📁 Category: <b>Telegram Old Accounts</b>\n"
+                f"🗑 All session files, orders &amp; transactions deleted.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        # /remove toa year country [numbers...]
+        number_tokens = []
+        country_tokens = []
+        for token in rest:
+            if _is_number(token):
+                number_tokens.append(token)
+            else:
+                if number_tokens:
+                    break
+                country_tokens.append(token)
+
+        country = " ".join(country_tokens).lower().strip()
+        if not country:
+            await message.answer(REMOVE_USAGE, parse_mode=ParseMode.HTML)
+            return
+
+        numbers = number_tokens[:10]
+
+        async with AsyncSessionFactory() as session:
+            if numbers:
+                rows = await session.execute(
+                    select(Product).where(
+                        Product.category == CATEGORY_TELEGRAM_OLD,
+                        Product.year == year,
+                        Product.country == country,
+                        Product.phone_number.in_(numbers),
+                    )
+                )
+            else:
+                rows = await session.execute(
+                    select(Product).where(
+                        Product.category == CATEGORY_TELEGRAM_OLD,
+                        Product.year == year,
+                        Product.country == country,
+                    )
+                )
+            products = rows.scalars().all()
+
+        if not products:
+            flag = get_country_flag(country)
+            await message.answer(
+                f"❌ No numbers found for {flag} <b>{country.title()}</b> "
+                f"({year}) in <b>Telegram Old Accounts</b>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        count = await _delete_products(list(products))
+        flag = get_country_flag(country)
+        await message.answer(
+            f"✅ <b>Removed {count} number(s)</b>\n\n"
+            f"📅 Year: <b>{year}</b>\n"
+            f"🌍 Country: {flag} <b>{country.title()}</b>\n"
+            f"📁 Category: <b>Telegram Old Accounts</b>\n"
+            f"🗑 All session files, orders &amp; transactions deleted.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── unrecognised subcommand ───────────────────────────────────────────────
+    await message.answer(REMOVE_USAGE, parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("listall"))
+@admin_only
+async def cmd_listall(message: Message) -> None:
+    """List every product in the database grouped by category and country."""
+    async with AsyncSessionFactory() as session:
+        rows = await session.execute(
+            select(Product)
+            .order_by(Product.category, Product.year, Product.country, Product.phone_number)
+        )
+        products = rows.scalars().all()
+
+        # Load custom category names
+        cc_rows = await session.execute(select(CustomCategory))
+        custom_cat_names = {cc.slug: cc.name for cc in cc_rows.scalars().all()}
+
+    if not products:
+        await message.answer("📦 <b>No products in the database.</b>", parse_mode=ParseMode.HTML)
+        return
+
+    # Group: cat_label → country_label → list of (phone, status)
+    grouped: dict[str, dict[str, list[tuple[str, str]]]] = {}
+    for p in products:
+        if p.category == CATEGORY_TELEGRAM_OLD and p.year:
+            cat_label = f"Telegram Old Accounts ({p.year})"
+        else:
+            cat_label = (
+                PRODUCT_CATEGORIES.get(p.category)
+                or custom_cat_names.get(p.category)
+                or p.category.replace("_", " ").title()
+            )
+        flag = get_country_flag(p.country)
+        country_label = f"{flag} {p.country.title()}"
+        grouped.setdefault(cat_label, {}).setdefault(country_label, []).append(
+            (p.phone_number, p.status)
+        )
+
+    total = len(products)
+    lines = [f"📦 <b>Full Inventory — {total} item(s)</b>\n"]
+    for cat_label in sorted(grouped):
+        lines.append(f"\n<b>━ {cat_label} ━</b>")
+        countries = grouped[cat_label]
+        for country_label in sorted(countries):
+            entries = countries[country_label]
+            status_counts: dict[str, int] = {}
+            for _, status in entries:
+                status_counts[status] = status_counts.get(status, 0) + 1
+            status_str = " · ".join(f"{v} {k}" for k, v in sorted(status_counts.items()))
+            lines.append(f"  {country_label} ({len(entries)}) [{status_str}]")
+            for num, _ in entries:
+                lines.append(f"    • <code>{num}</code>")
+
+    # Split into ≤4000-char chunks to stay within Telegram's message limit
+    chunks: list[str] = []
+    current_chunk: list[str] = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line) + 1  # +1 for newline
+        if current_len + line_len > 4000 and current_chunk:
+            chunks.append("\n".join(current_chunk))
+            current_chunk = [line]
+            current_len = line_len
+        else:
+            current_chunk.append(line)
+            current_len += line_len
+    if current_chunk:
+        chunks.append("\n".join(current_chunk))
+
+    for i, chunk in enumerate(chunks):
+        if i == 0:
+            await message.answer(chunk, parse_mode=ParseMode.HTML)
+        else:
+            await message.answer(f"<i>(continued…)</i>\n{chunk}", parse_mode=ParseMode.HTML)
 
 
 # ── /setbal command ───────────────────────────────────────────────────────────
@@ -7079,16 +7634,19 @@ async def _check_deposits(bot: Bot) -> None:
                         * Decimal(str(REFERRAL_COMMISSION_PCT))
                         / Decimal(100)
                     )
-                    await session.execute(
-                        update(User)
-                        .where(User.id == referred_by)
-                        .values(balance=User.balance + commission)
-                    )
-                    ref_txn = Transaction(
-                        user_id=referred_by, type="ReferralBonus",
-                        amount=commission, tx_hash=tx_hash, status="Completed",
-                    )
-                    session.add(ref_txn)
+                    if commission > 0:
+                        await session.execute(
+                            update(User)
+                            .where(User.id == referred_by)
+                            .values(balance=User.balance + commission)
+                        )
+                        ref_txn = Transaction(
+                            user_id=referred_by, type="ReferralBonus",
+                            amount=commission, tx_hash=tx_hash, status="Completed",
+                        )
+                        session.add(ref_txn)
+                    # Update referral benefit thresholds for the referrer
+                    await update_referral_benefits(session, referred_by)
 
                 await session.commit()
 
