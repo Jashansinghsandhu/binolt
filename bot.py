@@ -44,6 +44,7 @@ BOT_TOKEN = "8320586826:AAGsP6LgRM0nKXw_eb9NU7cP0TMo7LSTBqc"
 ADMIN_BOT_TOKEN = ""  # Set this to your second bot token for the ingestion bot
 
 ADMIN_IDS: list[int] = [6083286836]
+OWNER_ID: int = 6083286836  # Primary owner; only this user can /promote and /demote admins
 
 TELEGRAM_API_ID: int   = 31706595
 TELEGRAM_API_HASH: str = "6e70d58c2db95a6558486e6b22fbfd45"
@@ -193,7 +194,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -254,6 +255,7 @@ class User(Base):
     referred_by            = Column(BigInteger, nullable=True)
     created_at             = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     is_banned              = Column(Boolean, default=False, nullable=False, server_default="0")
+    is_admin               = Column(Boolean, default=False, nullable=False, server_default="0")
 
 
 class Product(Base):
@@ -391,6 +393,7 @@ async def init_db() -> None:
         # Migration: add new columns to existing databases
         migrations = [
             "ALTER TABLE users ADD COLUMN is_banned BOOLEAN NOT NULL DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT 0",
             "ALTER TABLE users ADD COLUMN first_name VARCHAR(128)",
             "ALTER TABLE users ADD COLUMN total_deposited NUMERIC(18, 6) DEFAULT 0",
             "ALTER TABLE users ADD COLUMN total_bonus_received NUMERIC(18, 6) DEFAULT 0",
@@ -1243,7 +1246,8 @@ class AdminUserDiscountState(StatesGroup):
 
 class ZipIngest(StatesGroup):
     """FSM for the secondary admin ingestion bot zip-upload flow."""
-    waiting_for_2fa = State()
+    waiting_for_single_2fa = State()   # Scenario A (<=5 sessions): per-session 2FA prompt
+    waiting_for_batch_2fa  = State()   # Scenario B (>5 sessions): single batch 2FA prompt
 
 class AdminCreateGiftCode(StatesGroup):
     amount         = State()
@@ -1291,6 +1295,26 @@ def admin_only(func):
             return
         return await func(event, *args, **kwargs)
     return wrapper
+
+
+class IsOwner(BaseFilter):
+    """True only for the primary bot owner (OWNER_ID)."""
+    async def __call__(self, message: Message) -> bool:
+        return message.from_user is not None and message.from_user.id == OWNER_ID
+
+
+class IsAdmin(BaseFilter):
+    """True for OWNER_ID, any user in ADMIN_IDS, or any user with is_admin=True in DB."""
+    async def __call__(self, message: Message) -> bool:
+        if not message.from_user:
+            return False
+        uid = message.from_user.id
+        if uid == OWNER_ID or uid in ADMIN_IDS:
+            return True
+        async with AsyncSessionFactory() as session:
+            result = await session.execute(select(User).where(User.id == uid))
+            user = result.scalar_one_or_none()
+            return user is not None and bool(user.is_admin)
 
 
 router = Router()
@@ -6464,6 +6488,9 @@ async def _check_pending_oxapay_payments(bot: Bot) -> None:
 
 admin_router = Router()
 
+# Sessions count threshold: ≤ this → individual 2FA check; > this → batch mode
+_INGEST_BATCH_THRESHOLD = 5
+
 
 async def check_2fa_with_session_file(phone: str, session_bytes: bytes) -> bool:
     """Return True if the Telegram account has 2FA enabled.
@@ -6593,12 +6620,80 @@ async def _ingest_session_bytes(
     return await _ingest_dual_records(phone, file_bytes, None, default_price, country)
 
 
+async def _finish_ingestion(message: Message, sessions_list: list[dict], default_price: Decimal) -> None:
+    """Insert all sessions (with their stored passwords) into the database."""
+    total_added = 0
+    summary_lines: list[str] = []
+    for item in sessions_list:
+        twofa_enc: Optional[str] = None
+        pwd = item.get("password")
+        if pwd and pwd.lower() != "none":
+            twofa_enc = encrypt_privkey(pwd)
+        added, lines = await _ingest_dual_records(
+            item["phone"], item["bytes"], twofa_enc, default_price, item["country"]
+        )
+        total_added += added
+        summary_lines.extend(lines)
+
+    lines_text = "\n".join(summary_lines[:50])
+    extra = f"\n…and {len(summary_lines) - 50} more" if len(summary_lines) > 50 else ""
+    await message.answer(
+        f"<b>Ingestion complete</b>\n\n"
+        f"✅ Added: <b>{total_added}</b> record(s)\n"
+        f"Default price: <b>${default_price:.2f} USDT</b>\n\n"
+        f"{lines_text}{extra}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _process_next_session_a(message: Message, state: FSMContext) -> None:
+    """Scenario A helper: continue checking sessions one by one.
+
+    Iterates from *current_index* in the FSM sessions_list, checks 2FA for each
+    session, and pauses at the first one that requires a password.  When all
+    sessions have been processed (or skipped) it calls _finish_ingestion.
+    """
+    data = await state.get_data()
+    sessions_list: list[dict] = data["sessions_list"]
+    current_index: int = data["current_index"]
+    default_price = Decimal(data["default_price"])
+
+    while current_index < len(sessions_list):
+        item = sessions_list[current_index]
+        await message.answer(
+            f"🔍 Checking 2FA for <code>+{item['phone']}</code> "
+            f"({current_index + 1}/{len(sessions_list)})…",
+            parse_mode=ParseMode.HTML,
+        )
+        has_2fa = await check_2fa_with_session_file(item["phone"], item["bytes"])
+        sessions_list[current_index]["has_2fa"] = has_2fa
+
+        if has_2fa:
+            await state.update_data(sessions_list=sessions_list, current_index=current_index)
+            await message.answer(
+                f"🔐 2FA is enabled for <code>+{item['phone']}</code>. "
+                f"Please enter the 2FA password:",
+                parse_mode=ParseMode.HTML,
+            )
+            await state.set_state(ZipIngest.waiting_for_single_2fa)
+            return
+
+        current_index += 1
+
+    # All sessions processed — insert into DB
+    await state.clear()
+    await message.answer("⏳ Inserting accounts into database…")
+    await _finish_ingestion(message, sessions_list, default_price)
+
+
 @admin_router.message(F.document)
 async def admin_ingest_file(message: Message, state: FSMContext) -> None:
-    """Receive .zip or .session file, check 2FA, and insert dual DB records.
+    """Receive .zip or .session file and process with appropriate 2FA flow.
 
-    If 2FA is detected on any account, pauses to ask the admin for the
-    password before inserting.  If no account has 2FA, inserts immediately.
+    * Scenario A (≤5 sessions): check 2FA per session, pause for each that
+      requires a password (waiting_for_single_2fa state).
+    * Scenario B (>5 sessions): check 2FA on the *first* session only; if
+      enabled, ask for a single batch password (waiting_for_batch_2fa state).
     """
     if message.from_user.id not in ADMIN_IDS:
         return
@@ -6626,8 +6721,8 @@ async def admin_ingest_file(message: Message, state: FSMContext) -> None:
 
     default_price = await get_default_session_price()
 
-    # Build list of (phone, session_bytes, country) from the upload
-    sessions: list[tuple[str, bytes, str]] = []
+    # Build list of session dicts from the upload
+    sessions_list: list[dict] = []
 
     if fname_lower.endswith(".session"):
         phone = re.sub(r"\D", "", os.path.splitext(doc.file_name)[0])
@@ -6635,7 +6730,7 @@ async def admin_ingest_file(message: Message, state: FSMContext) -> None:
             await message.answer("⚠️ Could not extract a phone number from the filename.")
             return
         country = detect_country_from_phone(phone)
-        sessions.append((phone, raw_bytes, country))
+        sessions_list.append({"phone": phone, "bytes": raw_bytes, "country": country, "has_2fa": False, "password": None})
 
     elif fname_lower.endswith(".zip"):
         try:
@@ -6649,7 +6744,7 @@ async def admin_ingest_file(message: Message, state: FSMContext) -> None:
                             try:
                                 session_bytes = zf.read(name)
                                 country = detect_country_from_phone(phone)
-                                sessions.append((phone, session_bytes, country))
+                                sessions_list.append({"phone": phone, "bytes": session_bytes, "country": country, "has_2fa": False, "password": None})
                             except Exception as exc:
                                 await message.answer(f"❌ {base} — read error: {exc}")
         except zipfile.BadZipFile:
@@ -6660,100 +6755,116 @@ async def admin_ingest_file(message: Message, state: FSMContext) -> None:
             await message.answer(f"❌ Error processing ZIP: {exc}")
             return
 
-    if not sessions:
+    if not sessions_list:
         await message.answer("⚠️ No valid <b>.session</b> files found.", parse_mode=ParseMode.HTML)
         return
 
-    await message.answer(f"⏳ Checking 2FA for {len(sessions)} account(s)…")
+    total_sessions = len(sessions_list)
+    await message.answer(
+        f"📦 Found <b>{total_sessions}</b> session file(s). "
+        f"{'Checking each individually…' if total_sessions <= _INGEST_BATCH_THRESHOLD else 'Batch mode — checking first session for 2FA…'}",
+        parse_mode=ParseMode.HTML,
+    )
 
-    # Check 2FA for each .session file
-    accounts_with_2fa: list[str] = []
-    account_data: list[dict] = []
-    for phone, s_bytes, country in sessions:
-        has_2fa = await check_2fa_with_session_file(phone, s_bytes)
-        account_data.append({"phone": phone, "bytes": s_bytes, "country": country, "has_2fa": has_2fa})
-        if has_2fa:
-            accounts_with_2fa.append(phone)
-
-    if accounts_with_2fa:
-        # Pause and ask admin for 2FA password; resume in admin_ingest_2fa_password
+    if total_sessions <= _INGEST_BATCH_THRESHOLD:
+        # ── Scenario A: individual per-session 2FA checking ──────────────────
         await state.update_data(
-            account_data=account_data,
+            sessions_list=sessions_list,
+            current_index=0,
             default_price=str(default_price),
         )
-        await state.set_state(ZipIngest.waiting_for_2fa)
-        phone_list = "\n".join(f"  • {p}" for p in accounts_with_2fa)
-        await message.answer(
-            f"🔐 <b>2FA detected on {len(accounts_with_2fa)} account(s):</b>\n{phone_list}\n\n"
-            f"Please send the <b>2FA password</b> for these accounts "
-            f"(it will be applied to all 2FA accounts in this batch).",
-            parse_mode=ParseMode.HTML,
-        )
+        await _process_next_session_a(message, state)
+
     else:
-        # No 2FA detected — insert all records immediately
-        total_added = 0
-        summary_lines: list[str] = []
-        for item in account_data:
-            added, lines = await _ingest_dual_records(
-                item["phone"], item["bytes"], None, default_price, item["country"]
+        # ── Scenario B: check only the first session ─────────────────────────
+        first = sessions_list[0]
+        has_2fa = await check_2fa_with_session_file(first["phone"], first["bytes"])
+        sessions_list[0]["has_2fa"] = has_2fa
+
+        if has_2fa:
+            await state.update_data(
+                sessions_list=sessions_list,
+                default_price=str(default_price),
             )
-            total_added += added
-            summary_lines.extend(lines)
+            await message.answer(
+                f"⚠️ Multiple sessions detected (>{_INGEST_BATCH_THRESHOLD}). 2FA is enabled on the first account.\n\n"
+                f"Make sure the password for <b>ALL</b> sessions in this batch is the same.\n"
+                f"Please enter the batch 2FA password, or send /cancel to abort ingestion.",
+                parse_mode=ParseMode.HTML,
+            )
+            await state.set_state(ZipIngest.waiting_for_batch_2fa)
+        else:
+            # No 2FA on first — insert all without password
+            await message.answer("⏳ No 2FA detected on first account. Inserting all sessions…")
+            await _finish_ingestion(message, sessions_list, default_price)
 
-        lines_text = "\n".join(summary_lines[:50])
-        extra = f"\n…and {len(summary_lines) - 50} more" if len(summary_lines) > 50 else ""
-        await message.answer(
-            f"<b>Ingestion complete</b>\n\n"
-            f"✅ Added: <b>{total_added}</b> record(s)\n"
-            f"Default price: <b>${default_price:.2f} USDT</b>\n\n"
-            f"{lines_text}{extra}",
-            parse_mode=ParseMode.HTML,
-        )
+
+async def _handle_ingest_cancel(message: Message, state: FSMContext) -> bool:
+    """Return True (and clear FSM) if the message is a /cancel command."""
+    if message.text and message.text.strip() == "/cancel":
+        await state.clear()
+        await message.answer("❌ Ingestion cancelled.")
+        return True
+    return False
 
 
-@admin_router.message(ZipIngest.waiting_for_2fa)
-async def admin_ingest_2fa_password(message: Message, state: FSMContext) -> None:
-    """Receive 2FA password and complete batch ingestion."""
+@admin_router.message(ZipIngest.waiting_for_single_2fa)
+async def admin_ingest_single_2fa_password(message: Message, state: FSMContext) -> None:
+    """Scenario A: receive 2FA password for the current session and continue the loop."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
+    if await _handle_ingest_cancel(message, state):
+        return
+
     twofa_plain = message.text.strip() if message.text else ""
-    twofa_enc: Optional[str] = None
-    if twofa_plain.lower() != "none" and twofa_plain:
-        twofa_enc = encrypt_privkey(twofa_plain)
+    if not twofa_plain:
+        await message.answer("⚠️ Please enter the 2FA password or send /cancel to abort.")
+        return
+
+    data = await state.get_data()
+    sessions_list: list[dict] = data["sessions_list"]
+    current_index: int = data["current_index"]
+
+    # Store the password for this session
+    sessions_list[current_index]["password"] = twofa_plain
+    current_index += 1
+
+    await state.update_data(sessions_list=sessions_list, current_index=current_index)
+    # Resume processing from the next session
+    await _process_next_session_a(message, state)
+
+
+@admin_router.message(ZipIngest.waiting_for_batch_2fa)
+async def admin_ingest_batch_2fa_password(message: Message, state: FSMContext) -> None:
+    """Scenario B: receive a single 2FA password and apply it to all sessions."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    if await _handle_ingest_cancel(message, state):
+        return
+
+    twofa_plain = message.text.strip() if message.text else ""
+    if not twofa_plain:
+        await message.answer("⚠️ Please enter the batch 2FA password or send /cancel to abort.")
+        return
 
     data = await state.get_data()
     await state.clear()
 
-    account_data: list[dict] = data.get("account_data", [])
+    sessions_list: list[dict] = data.get("sessions_list", [])
     default_price = Decimal(data.get("default_price", "1.00"))
 
-    if not account_data:
-        await message.answer("❌ No account data found. Please upload the file again.")
+    if not sessions_list:
+        await message.answer("❌ No session data found. Please upload the file again.")
         return
 
+    # Apply the batch password to all sessions
+    for item in sessions_list:
+        item["password"] = twofa_plain
+
     await message.answer("⏳ Inserting accounts into database…")
-
-    total_added = 0
-    summary_lines: list[str] = []
-    for item in account_data:
-        # Only apply 2FA password to accounts that actually have 2FA enabled
-        effective_twofa_enc = twofa_enc if item["has_2fa"] else None
-        added, lines = await _ingest_dual_records(
-            item["phone"], item["bytes"], effective_twofa_enc, default_price, item["country"]
-        )
-        total_added += added
-        summary_lines.extend(lines)
-
-    lines_text = "\n".join(summary_lines[:50])
-    extra = f"\n…and {len(summary_lines) - 50} more" if len(summary_lines) > 50 else ""
-    await message.answer(
-        f"<b>Ingestion complete</b>\n\n"
-        f"✅ Added: <b>{total_added}</b> record(s)\n"
-        f"Default price: <b>${default_price:.2f} USDT</b>\n\n"
-        f"{lines_text}{extra}",
-        parse_mode=ParseMode.HTML,
-    )
+    await _finish_ingestion(message, sessions_list, default_price)
 
 
 @admin_router.message(Command("setprice"))
@@ -6795,6 +6906,111 @@ async def admin_bot_start(message: Message) -> None:
         f"• <code>/setprice &lt;amount&gt;</code> — set default price for new sessions",
         parse_mode=ParseMode.HTML,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CANCEL, PROMOTE, DEMOTE COMMANDS
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@admin_router.message(Command("cancel"))
+async def admin_cancel(message: Message, state: FSMContext) -> None:
+    """Cancel any active ingestion FSM and clean up temp session files."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("ℹ️ No active operation to cancel.")
+        return
+    await state.clear()
+    await message.answer("❌ Operation cancelled. FSM state cleared.")
+
+
+@router.message(Command("cancel"))
+async def router_cancel(message: Message, state: FSMContext) -> None:
+    """Cancel any active FSM operation in the main bot."""
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("ℹ️ No active operation to cancel.")
+        return
+    await state.clear()
+    await message.answer("❌ Operation cancelled.")
+
+
+async def _resolve_user_identifier(session: AsyncSession, identifier: str) -> Optional[User]:
+    """Resolve a user_id or @username string to a User DB object."""
+    identifier = identifier.strip().lstrip("@")
+    # Try numeric ID first
+    try:
+        uid = int(identifier)
+        result = await session.execute(select(User).where(User.id == uid))
+        return result.scalar_one_or_none()
+    except ValueError:
+        pass
+    # Try username (case-insensitive), exclude rows where username is NULL
+    result = await session.execute(
+        select(User).where(User.username.isnot(None), User.username.ilike(identifier))
+    )
+    return result.scalar_one_or_none()
+
+
+async def _set_admin_flag(message: Message, identifier: str, is_admin_value: bool) -> None:
+    """Shared logic for /promote and /demote: update is_admin flag and reply."""
+    async with AsyncSessionFactory() as session:
+        user = await _resolve_user_identifier(session, identifier)
+        if user is None:
+            await message.answer(
+                f"❌ User <code>{identifier}</code> not found in the database.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        await session.execute(update(User).where(User.id == user.id).values(is_admin=is_admin_value))
+        await session.commit()
+    action = "promoted to admin" if is_admin_value else "demoted"
+    await message.answer(
+        f"✅ User <code>{user.id}</code> (@{user.username or 'N/A'}) {action}.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("promote"), IsOwner())
+async def cmd_promote(message: Message) -> None:
+    """/promote <user_id|@username> — promote a user to admin (owner only)."""
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Usage: <code>/promote &lt;user_id or @username&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+    await _set_admin_flag(message, parts[1].strip(), True)
+
+
+@router.message(Command("demote"), IsOwner())
+async def cmd_demote(message: Message) -> None:
+    """/demote <user_id|@username> — remove admin privileges (owner only)."""
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Usage: <code>/demote &lt;user_id or @username&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+    await _set_admin_flag(message, parts[1].strip(), False)
+
+
+@admin_router.message(Command("promote"), IsOwner())
+async def admin_bot_promote(message: Message) -> None:
+    """/promote on the admin ingestion bot (mirrors main bot promote)."""
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Usage: <code>/promote &lt;user_id or @username&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+    await _set_admin_flag(message, parts[1].strip(), True)
+
+
+@admin_router.message(Command("demote"), IsOwner())
+async def admin_bot_demote(message: Message) -> None:
+    """/demote on the admin ingestion bot (mirrors main bot demote)."""
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Usage: <code>/demote &lt;user_id or @username&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+    await _set_admin_flag(message, parts[1].strip(), False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
