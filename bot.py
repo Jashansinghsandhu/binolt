@@ -2202,11 +2202,15 @@ async def cb_buy_cat_telegram(query: CallbackQuery) -> None:
     await query.answer()
     await query.message.edit_text(
         "<tg-emoji emoji-id=\"5197252827247841976\">📱</tg-emoji> <b>Telegram Accounts</b>\n\n"
-        "Choose account type:",
+        "<tg-emoji emoji-id=\"5900086068748752426\">⚡</tg-emoji> Premium quality, instantly delivered\n"
+        "<tg-emoji emoji-id=\"5987708392339150189\">💎</tg-emoji> Multiple account types available\n"
+        "<tg-emoji emoji-id=\"5343984088493599366\">✨</tg-emoji> Session files included with all accounts\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "<tg-emoji emoji-id=\"5274055917766202507\">📋</tg-emoji> <b>Choose your preferred account type:</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [apply_button_style(InlineKeyboardButton(text="Telegram Accounts", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_ACCOUNTS}"), 'primary', "5197252827247841976")],
-            [apply_button_style(InlineKeyboardButton(text="Telegram Old Accounts", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_OLD}"), 'primary', "5197252827247841976")],
-            [apply_button_style(InlineKeyboardButton(text="Telegram Premium", callback_data="buy_prem"), 'success', "5453901475648390219")],
+            [apply_button_style(InlineKeyboardButton(text="📱 Telegram Accounts", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_ACCOUNTS}"), 'primary', "5197252827247841976")],
+            [apply_button_style(InlineKeyboardButton(text="📅 Telegram Old Accounts", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_OLD}"), 'primary', "5197252827247841976")],
+            [apply_button_style(InlineKeyboardButton(text="⭐ Telegram Premium", callback_data="buy_prem"), 'success', "5453901475648390219")],
             [apply_button_style(InlineKeyboardButton(text="Back", callback_data="buy"), 'danger', "5416041192905265756")],
         ]),
         parse_mode=ParseMode.HTML,
@@ -2349,11 +2353,37 @@ async def _show_category_countries(
         buttons.append([apply_button_style(InlineKeyboardButton(text="Back", callback_data="buy"), 'danger', "5416041192905265756")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    text = (
-        f"{category_name}\n\n"
-        f"<tg-emoji emoji-id=\"5460755126761312667\">🌍</tg-emoji> <b>Select a Country</b> (Page {page + 1}/{total_pages}):\n"
-        f"<i>Number in brackets = Available count</i>"
-    )
+
+    # Build a rich header based on category
+    if category == CATEGORY_TELEGRAM_ACCOUNTS:
+        text = (
+            f"<tg-emoji emoji-id=\"5197252827247841976\">📱</tg-emoji> <b>Telegram Accounts</b>\n\n"
+            f"<tg-emoji emoji-id=\"5900086068748752426\">⚡</tg-emoji> Instant delivery after purchase\n"
+            f"<tg-emoji emoji-id=\"5987708392339150189\">💎</tg-emoji> Full account access with session file\n"
+            f"<tg-emoji emoji-id=\"5343984088493599366\">✨</tg-emoji> OTP delivered automatically — no waiting\n"
+            f"<tg-emoji emoji-id=\"5409048419211682843\">💰</tg-emoji> Best prices, multiple countries available\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<tg-emoji emoji-id=\"5460755126761312667\">🌍</tg-emoji> <b>Select a Country</b> (Page {page + 1}/{total_pages}):\n"
+            f"<i>Number in brackets = available stock</i>"
+        )
+    elif category == CATEGORY_TELEGRAM_SESSIONS:
+        text = (
+            f"<tg-emoji emoji-id=\"5427168083074628963\">🔐</tg-emoji> <b>Telegram Sessions</b>\n\n"
+            f"<tg-emoji emoji-id=\"5900086068748752426\">⚡</tg-emoji> Pre-authorized .session files — use instantly\n"
+            f"<tg-emoji emoji-id=\"5987708392339150189\">💎</tg-emoji> No OTP needed — ready to go immediately\n"
+            f"<tg-emoji emoji-id=\"5343984088493599366\">✨</tg-emoji> Perfect for automation, bots & tools\n"
+            f"<tg-emoji emoji-id=\"5274055917766202507\">📋</tg-emoji> Works with Telethon, Pyrogram & more\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<tg-emoji emoji-id=\"5460755126761312667\">🌍</tg-emoji> <b>Select a Country</b> (Page {page + 1}/{total_pages}):\n"
+            f"<i>Number in brackets = available stock</i>"
+        )
+    else:
+        text = (
+            f"{category_name}\n\n"
+            f"<tg-emoji emoji-id=\"5460755126761312667\">🌍</tg-emoji> <b>Select a Country</b> (Page {page + 1}/{total_pages}):\n"
+            f"<i>Number in brackets = available stock</i>"
+        )
+
     if edit:
         await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
     else:
@@ -2781,8 +2811,13 @@ async def _show_old_account_years(message: Message, edit: bool = False) -> None:
 
     kb = InlineKeyboardMarkup(inline_keyboard=year_buttons)
     text_msg = (
-        "📱 <b>Telegram Old Accounts</b>\n\n"
-        "🗓️ <b>Select a Year:</b>\n"
+        "<tg-emoji emoji-id=\"5197252827247841976\">📱</tg-emoji> <b>Telegram Old Accounts</b>\n\n"
+        "<tg-emoji emoji-id=\"5343984088493599366\">✨</tg-emoji> Aged accounts with years of history\n"
+        "<tg-emoji emoji-id=\"5987708392339150189\">💎</tg-emoji> Higher trust score & better standing\n"
+        "<tg-emoji emoji-id=\"5900086068748752426\">⚡</tg-emoji> Full access — session file included\n"
+        "<tg-emoji emoji-id=\"5409048419211682843\">💰</tg-emoji> Ideal for ads, channels & outreach\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "<tg-emoji emoji-id=\"5274055917766202507\">📅</tg-emoji> <b>Select the account creation year:</b>\n"
         "<i>Only years with available stock are shown</i>"
     )
     if edit:
@@ -2849,9 +2884,13 @@ async def _show_old_account_countries(
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     text_msg = (
-        f"📱 <b>Telegram Old Accounts ({year})</b>\n\n"
-        f"🌍 <b>Select a Country:</b>\n"
-        f"<i>Number in brackets = Available count</i>"
+        f"<tg-emoji emoji-id=\"5197252827247841976\">📱</tg-emoji> <b>Telegram Old Accounts — {year}</b>\n\n"
+        f"<tg-emoji emoji-id=\"5343984088493599366\">✨</tg-emoji> Accounts created in <b>{year}</b> — aged &amp; trusted\n"
+        f"<tg-emoji emoji-id=\"5987708392339150189\">💎</tg-emoji> Session file included — full account access\n"
+        f"<tg-emoji emoji-id=\"5900086068748752426\">⚡</tg-emoji> Instantly delivered after purchase\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<tg-emoji emoji-id=\"5460755126761312667\">🌍</tg-emoji> <b>Select a Country:</b>\n"
+        f"<i>Number in brackets = available stock</i>"
     )
     if edit:
         await message.edit_text(text_msg, reply_markup=kb, parse_mode=ParseMode.HTML)
@@ -3187,17 +3226,29 @@ async def cb_buy_prem(query: CallbackQuery) -> None:
         return
 
     buttons = []
+    row_p: list[InlineKeyboardButton] = []
     for c in countries:
         flag = get_country_flag(c.country)
-        buttons.append([apply_button_style(InlineKeyboardButton(
+        btn = apply_button_style(InlineKeyboardButton(
             text=f"{flag} {c.country.title()} — ${float(c.price):.2f}",
             callback_data=f"buy_prem_ctry_{c.id}",
-        ), 'primary', "5453901475648390219")])
+        ), 'primary', "5453901475648390219")
+        row_p.append(btn)
+        if len(row_p) == 2:
+            buttons.append(row_p)
+            row_p = []
+    if row_p:
+        buttons.append(row_p)
     buttons.append([apply_button_style(InlineKeyboardButton(text="Back", callback_data="buy_cat_telegram"), 'danger', "5416041192905265756")])
 
     await query.message.edit_text(
         "<tg-emoji emoji-id=\"5453901475648390219\">⭐</tg-emoji> <b>Telegram Premium</b>\n\n"
-        "Select a country:",
+        "<tg-emoji emoji-id=\"5343984088493599366\">✨</tg-emoji> Official Telegram Premium subscription\n"
+        "<tg-emoji emoji-id=\"5987708392339150189\">💎</tg-emoji> 3 months of exclusive Premium features\n"
+        "<tg-emoji emoji-id=\"5900086068748752426\">⚡</tg-emoji> Delivered to any phone number — fast\n"
+        "<tg-emoji emoji-id=\"5409048419211682843\">💰</tg-emoji> Best rates, multiple countries available\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "<tg-emoji emoji-id=\"5460755126761312667\">🌍</tg-emoji> <b>Select a Country:</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode=ParseMode.HTML,
     )
