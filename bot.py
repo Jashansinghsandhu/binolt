@@ -77,6 +77,10 @@ DATABASE_URL = "sqlite+aiosqlite:///marketplace.db"
 BLOCKCHAIN_STATE_FILE = "blockchain_state.json"
 FERNET_KEY = "m8gzSFYcYk41uYxNUqCwpn-YGvo1_sVwDNTg-2FgBTg="
 
+# Default 2FA password used when changing 2FA during session ingestion.
+# Can be overridden at runtime via /set2fapass command (stored in Settings table).
+DEFAULT_2FA_PASSWORD = "BMW"
+
 # Deposit bonus configuration
 DEPOSIT_BONUSES = {
     20: 5,    # 5% bonus for $20 deposit
@@ -218,7 +222,9 @@ log = logging.getLogger(__name__)
 
 try:
     from telethon import TelegramClient
-    from telethon.tl.functions.account import GetPasswordRequest
+    from telethon.tl.functions.account import GetPasswordRequest, UpdatePasswordSettingsRequest
+    from telethon.tl.types.account import PasswordInputSettings
+    from telethon.password import compute_check, compute_hash
 
     TELETHON_AVAILABLE = True
     log.info("Telethon loaded successfully.")
@@ -629,6 +635,43 @@ async def set_default_session_price(price: Decimal) -> None:
             session.add(Settings(
                 key="default_session_price",
                 value=str(price),
+                updated_at=datetime.now(timezone.utc),
+            ))
+        await session.commit()
+
+
+async def get_default_2fa_password() -> str:
+    """Fetch the global default 2FA password from the Settings table.
+
+    Falls back to the compiled-in DEFAULT_2FA_PASSWORD constant if not set.
+    """
+    async with AsyncSessionFactory() as session:
+        result = await session.execute(
+            select(Settings).where(Settings.key == "default_2fa_password")
+        )
+        row = result.scalar_one_or_none()
+        if row and row.value:
+            return row.value
+    return DEFAULT_2FA_PASSWORD
+
+
+async def set_default_2fa_password(password: str) -> None:
+    """Persist the global default 2FA password to the Settings table."""
+    async with AsyncSessionFactory() as session:
+        result = await session.execute(
+            select(Settings).where(Settings.key == "default_2fa_password")
+        )
+        row = result.scalar_one_or_none()
+        if row:
+            await session.execute(
+                update(Settings)
+                .where(Settings.key == "default_2fa_password")
+                .values(value=password, updated_at=datetime.now(timezone.utc))
+            )
+        else:
+            session.add(Settings(
+                key="default_2fa_password",
+                value=password,
                 updated_at=datetime.now(timezone.utc),
             ))
         await session.commit()
@@ -6543,42 +6586,133 @@ admin_router = Router()
 _INGEST_BATCH_THRESHOLD = 5
 
 
+def _cleanup_temp_session(tmp_path: str) -> None:
+    """Remove a temporary .session file and its SQLite companions."""
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        path = tmp_path + suffix
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception as exc:
+            log.warning("Could not delete temp session file %s: %s", path, exc)
+
+
 async def check_2fa_with_session_file(phone: str, session_bytes: bytes) -> bool:
     """Return True if the Telegram account has 2FA enabled.
 
     Writes the session bytes to a uniquely named temporary file, starts a
     Telethon TelegramClient from it, and queries the GetPassword RPC.  The temp
     file (and any SQLite WAL/SHM companions) is deleted afterwards.
-    Returns False on any error or when Telethon is not installed.
+
+    Retries up to 2 times with exponential back-off on transient errors.
+    On any unresolvable error, returns True (safer: ask admin for password
+    rather than silently skipping a 2FA-protected account).
     """
     if not TELETHON_AVAILABLE:
-        return False
-    # Use a UUID-based name so concurrent checks for different phones
-    # never collide and the path is not guessable.
-    tmp_stem = f"temp_admin_check_{uuid.uuid4().hex}"
+        log.warning("Telethon unavailable — cannot check 2FA for %s, assuming True", phone)
+        return True
+
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        tmp_stem = f"temp_admin_check_{uuid.uuid4().hex}"
+        tmp_path = f"{tmp_stem}.session"
+        client = TelegramClient(tmp_stem, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(session_bytes)
+            await client.connect()
+            pwd = await client(GetPasswordRequest())
+            return bool(pwd.has_password)
+        except Exception as exc:
+            log.warning(
+                "2FA check attempt %d/%d failed for +%s: %s",
+                attempt, max_attempts, phone, exc,
+            )
+            if attempt < max_attempts:
+                backoff = 2 ** attempt  # 2s, 4s
+                await asyncio.sleep(backoff)
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            _cleanup_temp_session(tmp_path)
+
+    # All attempts exhausted — assume 2FA is enabled so admin is prompted
+    log.warning(
+        "2FA detection failed for +%s after %d attempts — defaulting to True (will ask for password)",
+        phone, max_attempts,
+    )
+    return True
+
+
+async def change_2fa_password(
+    session_bytes: bytes,
+    old_password: str,
+    new_password: str,
+) -> tuple[bool, str]:
+    """Verify *old_password* via SRP and change the 2FA password to *new_password*.
+
+    Returns (success: bool, message: str).
+    The session file bytes are written to a temp file and cleaned up afterwards.
+    """
+    if not TELETHON_AVAILABLE:
+        return False, "Telethon is not installed."
+
+    tmp_stem = f"temp_admin_chpwd_{uuid.uuid4().hex}"
     tmp_path = f"{tmp_stem}.session"
     client = TelegramClient(tmp_stem, TELEGRAM_API_ID, TELEGRAM_API_HASH)
     try:
         with open(tmp_path, "wb") as f:
             f.write(session_bytes)
         await client.connect()
-        pwd = await client(GetPasswordRequest())
-        return bool(pwd.has_password)
+
+        # Fetch current password settings (SRP params + has_password flag)
+        pwd_info = await client(GetPasswordRequest())
+
+        if not pwd_info.has_password:
+            # No 2FA on this account — nothing to change
+            return True, "no_2fa"
+
+        # Compute SRP check for the old password
+        try:
+            srp_answer = compute_check(pwd_info, old_password)
+        except Exception as exc:
+            log.warning("SRP compute_check failed: %s", exc)
+            return False, f"Wrong 2FA password or SRP error: {exc}"
+
+        # Compute the new password hash using the fresh algo supplied by Telegram
+        new_algo = pwd_info.new_algo
+        try:
+            new_hash = compute_hash(new_algo, new_password)
+        except Exception as exc:
+            log.error("Failed to compute new 2FA hash: %s", exc)
+            return False, f"Failed to compute new password hash: {exc}"
+
+        new_settings = PasswordInputSettings(
+            new_algo=new_algo,
+            new_password_hash=new_hash,
+            hint="",
+        )
+
+        await client(UpdatePasswordSettingsRequest(
+            password=srp_answer,
+            new_settings=new_settings,
+        ))
+        return True, "changed"
+
     except Exception as exc:
-        log.warning("2FA check via Telethon failed for %s: %s", phone, exc)
-        return False
+        err_str = str(exc)
+        log.warning("change_2fa_password failed: %s", err_str)
+        if "PASSWORD_HASH_INVALID" in err_str or "SRP_PASSWORD_CHANGED" in err_str:
+            return False, "wrong_password"
+        return False, err_str
     finally:
         try:
             await client.disconnect()
         except Exception:
             pass
-        for suffix in ("", "-wal", "-shm", "-journal"):
-            path = tmp_path + suffix
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except Exception as exc:
-                log.warning("Could not delete temp 2FA check file %s: %s", path, exc)
+        _cleanup_temp_session(tmp_path)
 
 
 async def _ingest_dual_records(
@@ -6702,12 +6836,13 @@ async def _process_next_session_a(message: Message, state: FSMContext) -> None:
 
     Iterates from *current_index* in the FSM sessions_list, checks 2FA for each
     session, and pauses at the first one that requires a password.  When all
-    sessions have been processed (or skipped) it calls _finish_ingestion.
+    sessions have been processed it calls _finish_ingestion.
     """
     data = await state.get_data()
     sessions_list: list[dict] = data["sessions_list"]
     current_index: int = data["current_index"]
     default_price = Decimal(data["default_price"])
+    new_2fa_pass = data.get("new_2fa_pass", DEFAULT_2FA_PASSWORD)
 
     while current_index < len(sessions_list):
         item = sessions_list[current_index]
@@ -6722,8 +6857,10 @@ async def _process_next_session_a(message: Message, state: FSMContext) -> None:
         if has_2fa:
             await state.update_data(sessions_list=sessions_list, current_index=current_index)
             await message.answer(
-                f"🔐 2FA is enabled for <code>+{item['phone']}</code>. "
-                f"Please enter the 2FA password:",
+                f"🔐 2FA Detected for <code>+{item['phone']}</code>.\n\n"
+                f"Send the old 2FA password now. "
+                f"Password will be changed to <b>{new_2fa_pass}</b>.\n\n"
+                f"Or send /cancel to abort ingestion.",
                 parse_mode=ParseMode.HTML,
             )
             await state.set_state(ZipIngest.waiting_for_single_2fa)
@@ -6771,6 +6908,7 @@ async def admin_ingest_file(message: Message, state: FSMContext) -> None:
         return
 
     default_price = await get_default_session_price()
+    new_2fa_pass = await get_default_2fa_password()
 
     # Build list of session dicts from the upload
     sessions_list: list[dict] = []
@@ -6823,12 +6961,17 @@ async def admin_ingest_file(message: Message, state: FSMContext) -> None:
             sessions_list=sessions_list,
             current_index=0,
             default_price=str(default_price),
+            new_2fa_pass=new_2fa_pass,
         )
         await _process_next_session_a(message, state)
 
     else:
         # ── Scenario B: check only the first session ─────────────────────────
         first = sessions_list[0]
+        await message.answer(
+            f"🔍 Checking 2FA for <code>+{first['phone']}</code> (1/{total_sessions})…",
+            parse_mode=ParseMode.HTML,
+        )
         has_2fa = await check_2fa_with_session_file(first["phone"], first["bytes"])
         sessions_list[0]["has_2fa"] = has_2fa
 
@@ -6836,11 +6979,15 @@ async def admin_ingest_file(message: Message, state: FSMContext) -> None:
             await state.update_data(
                 sessions_list=sessions_list,
                 default_price=str(default_price),
+                new_2fa_pass=new_2fa_pass,
             )
             await message.answer(
-                f"⚠️ Multiple sessions detected (>{_INGEST_BATCH_THRESHOLD}). 2FA is enabled on the first account.\n\n"
-                f"Make sure the password for <b>ALL</b> sessions in this batch is the same.\n"
-                f"Please enter the batch 2FA password, or send /cancel to abort ingestion.",
+                f"🔐 2FA Detected for <code>+{first['phone']}</code>.\n\n"
+                f"⚠️ Batch mode: <b>{total_sessions}</b> sessions detected. "
+                f"All sessions must share the same 2FA password.\n\n"
+                f"Send the old 2FA password now. "
+                f"Password will be changed to <b>{new_2fa_pass}</b>.\n\n"
+                f"Or send /cancel to abort ingestion.",
                 parse_mode=ParseMode.HTML,
             )
             await state.set_state(ZipIngest.waiting_for_batch_2fa)
@@ -6861,58 +7008,132 @@ async def _handle_ingest_cancel(message: Message, state: FSMContext) -> bool:
 
 @admin_router.message(ZipIngest.waiting_for_single_2fa)
 async def admin_ingest_single_2fa_password(message: Message, state: FSMContext) -> None:
-    """Scenario A: receive 2FA password for the current session and continue the loop."""
+    """Scenario A: receive old 2FA password, change it to the default, then continue."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
     if await _handle_ingest_cancel(message, state):
         return
 
-    twofa_plain = message.text.strip() if message.text else ""
-    if not twofa_plain:
-        await message.answer("⚠️ Please enter the 2FA password or send /cancel to abort.")
+    old_password = message.text.strip() if message.text else ""
+    if not old_password:
+        await message.answer("⚠️ Please enter the old 2FA password or send /cancel to abort.")
         return
 
     data = await state.get_data()
     sessions_list: list[dict] = data["sessions_list"]
     current_index: int = data["current_index"]
+    new_2fa_pass: str = data.get("new_2fa_pass", DEFAULT_2FA_PASSWORD)
+    item = sessions_list[current_index]
 
-    # Store the password for this session
-    sessions_list[current_index]["password"] = twofa_plain
+    await message.answer(
+        f"🔄 Verifying old password and changing 2FA for <code>+{item['phone']}</code>…",
+        parse_mode=ParseMode.HTML,
+    )
+
+    ok, result_msg = await change_2fa_password(item["bytes"], old_password, new_2fa_pass)
+
+    if result_msg == "wrong_password":
+        await message.answer(
+            f"❌ Wrong 2FA password for <code>+{item['phone']}</code>.\n\n"
+            f"Please enter the correct old 2FA password, or send /cancel to abort.",
+            parse_mode=ParseMode.HTML,
+        )
+        return  # Stay in waiting_for_single_2fa, let admin retry
+
+    if not ok:
+        await message.answer(
+            f"⚠️ Could not change 2FA for <code>+{item['phone']}</code>: {result_msg}\n\n"
+            f"Storing the provided password as-is and continuing.",
+            parse_mode=ParseMode.HTML,
+        )
+        # Fall back: store the old password the admin supplied
+        sessions_list[current_index]["password"] = old_password
+    else:
+        if result_msg == "no_2fa":
+            await message.answer(
+                f"ℹ️ <code>+{item['phone']}</code> has no 2FA — no change needed.",
+                parse_mode=ParseMode.HTML,
+            )
+            sessions_list[current_index]["password"] = None
+        else:
+            await message.answer(
+                f"✅ 2FA password changed to <b>{new_2fa_pass}</b> for <code>+{item['phone']}</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            sessions_list[current_index]["password"] = new_2fa_pass
+
     current_index += 1
-
     await state.update_data(sessions_list=sessions_list, current_index=current_index)
-    # Resume processing from the next session
     await _process_next_session_a(message, state)
 
 
 @admin_router.message(ZipIngest.waiting_for_batch_2fa)
 async def admin_ingest_batch_2fa_password(message: Message, state: FSMContext) -> None:
-    """Scenario B: receive a single 2FA password and apply it to all sessions."""
+    """Scenario B: receive old 2FA password, change it on all sessions, then ingest."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
     if await _handle_ingest_cancel(message, state):
         return
 
-    twofa_plain = message.text.strip() if message.text else ""
-    if not twofa_plain:
+    old_password = message.text.strip() if message.text else ""
+    if not old_password:
         await message.answer("⚠️ Please enter the batch 2FA password or send /cancel to abort.")
         return
 
     data = await state.get_data()
-    await state.clear()
-
     sessions_list: list[dict] = data.get("sessions_list", [])
     default_price = Decimal(data.get("default_price", "1.00"))
+    new_2fa_pass: str = data.get("new_2fa_pass", DEFAULT_2FA_PASSWORD)
+
+    await state.clear()
 
     if not sessions_list:
         await message.answer("❌ No session data found. Please upload the file again.")
         return
 
-    # Apply the batch password to all sessions
+    total = len(sessions_list)
+    await message.answer(
+        f"🔄 Changing 2FA password for <b>{total}</b> session(s). This may take a moment…",
+        parse_mode=ParseMode.HTML,
+    )
+
+    changed_ok = 0
+    changed_fail = 0
     for item in sessions_list:
-        item["password"] = twofa_plain
+        if not item.get("has_2fa"):
+            item["password"] = None
+            continue
+
+        ok, result_msg = await change_2fa_password(item["bytes"], old_password, new_2fa_pass)
+        if result_msg == "wrong_password":
+            await message.answer(
+                f"❌ Wrong 2FA password for <code>+{item['phone']}</code>. "
+                f"Skipping this account.",
+                parse_mode=ParseMode.HTML,
+            )
+            item["password"] = None
+            changed_fail += 1
+        elif not ok:
+            await message.answer(
+                f"⚠️ Could not change 2FA for <code>+{item['phone']}</code>: {result_msg}. "
+                f"Storing provided password as-is.",
+                parse_mode=ParseMode.HTML,
+            )
+            item["password"] = old_password
+            changed_fail += 1
+        elif result_msg == "no_2fa":
+            item["password"] = None
+        else:
+            item["password"] = new_2fa_pass
+            changed_ok += 1
+
+    if changed_ok or changed_fail:
+        await message.answer(
+            f"🔐 2FA change results: ✅ {changed_ok} changed, ❌ {changed_fail} failed.",
+            parse_mode=ParseMode.HTML,
+        )
 
     await message.answer("⏳ Inserting accounts into database…")
     await _finish_ingestion(message, sessions_list, default_price)
@@ -6943,18 +7164,51 @@ async def admin_set_price(message: Message) -> None:
     await message.answer(f"✅ Default session price set to <b>${price:.2f} USDT</b>.", parse_mode=ParseMode.HTML)
 
 
+@admin_router.message(Command("set2fapass"))
+async def admin_set_2fa_pass(message: Message) -> None:
+    """Set the default 2FA password used when changing 2FA during ingestion.
+
+    Usage: /set2fapass BMW
+    When no argument is given, shows the current default.
+    """
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        current = await get_default_2fa_password()
+        await message.answer(
+            f"Current default 2FA password: <b>{current}</b>\n\n"
+            f"Usage: <code>/set2fapass &lt;new_password&gt;</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    new_pass = parts[1].strip()
+    if not new_pass:
+        await message.answer("❌ Password cannot be empty.", parse_mode=ParseMode.HTML)
+        return
+    await set_default_2fa_password(new_pass)
+    await message.answer(
+        f"✅ Default 2FA password set to <b>{new_pass}</b>.\n\n"
+        f"New sessions with 2FA will have their password changed to this value during ingestion.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 @admin_router.message(CommandStart())
 async def admin_bot_start(message: Message) -> None:
     if message.from_user.id not in ADMIN_IDS:
         return
     current_price = await get_default_session_price()
+    current_2fa = await get_default_2fa_password()
     await message.answer(
         f"<b>Session Ingestion Bot</b>\n\n"
         f"Upload a <b>.session</b> file or a <b>.zip</b> archive of session files and "
         f"they will be automatically added to the marketplace database.\n\n"
-        f"Current default session price: <b>${current_price:.2f} USDT</b>\n\n"
+        f"Current default session price: <b>${current_price:.2f} USDT</b>\n"
+        f"Current default 2FA password: <b>{current_2fa}</b>\n\n"
         f"Commands:\n"
-        f"• <code>/setprice &lt;amount&gt;</code> — set default price for new sessions",
+        f"• <code>/setprice &lt;amount&gt;</code> — set default price for new sessions\n"
+        f"• <code>/set2fapass &lt;password&gt;</code> — set default 2FA replacement password",
         parse_mode=ParseMode.HTML,
     )
 
