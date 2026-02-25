@@ -103,6 +103,8 @@ PRODUCT_CATEGORIES = {
     CATEGORY_TELEGRAM_PREMIUM: "⭐ Telegram Premium",
 }
 
+PURCHASES_PAGE_SIZE = 10
+
 COUNTRY_FLAGS: dict[str, str] = {
     "india": "🇮🇳", "pakistan": "🇵🇰", "bangladesh": "🇧🇩",
     "sri lanka": "🇱🇰", "nepal": "🇳🇵", "myanmar": "🇲🇲",
@@ -6692,27 +6694,37 @@ async def cmd_claim(message: Message) -> None:
 
 @router.callback_query(F.data == "my_purchases")
 async def cb_my_purchases(query: CallbackQuery) -> None:
+    """Show a category-selection menu for the user's completed purchases."""
     await query.answer()
     user_id = query.from_user.id
     async with AsyncSessionFactory() as session:
         ord_rows = await session.execute(
             select(Order)
             .where(Order.user_id == user_id, Order.status == "Completed")
-            .order_by(Order.created_at.desc())
         )
         orders = ord_rows.scalars().all()
 
         product_ids = [o.product_id for o in orders]
-        products_map: dict[int, Product] = {}
+        category_counts: dict[str, int] = {}
+        custom_category_names: dict[str, str] = {}
         if product_ids:
             prod_rows = await session.execute(
                 select(Product).where(Product.id.in_(product_ids))
             )
-            products_map = {p.id: p for p in prod_rows.scalars().all()}
+            for p in prod_rows.scalars().all():
+                category_counts[p.category] = category_counts.get(p.category, 0) + 1
 
-    if not orders:
+            custom_slugs = [cat for cat in category_counts if cat not in PRODUCT_CATEGORIES]
+            if custom_slugs:
+                cc_rows = await session.execute(
+                    select(CustomCategory).where(CustomCategory.slug.in_(custom_slugs))
+                )
+                for cc in cc_rows.scalars().all():
+                    custom_category_names[cc.slug] = cc.name
+
+    if not category_counts:
         await query.message.edit_text(
-            "<tg-emoji emoji-id=\"5406683434124859552\">📦</tg-emoji> You haven't purchased any numbers yet.",
+            "<tg-emoji emoji-id=\"5406683434124859552\">📦</tg-emoji> You haven't purchased anything yet.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 apply_button_style(InlineKeyboardButton(text="Back", callback_data="back_main"), 'danger', "5416041192905265756"),
             ]]),
@@ -6720,7 +6732,82 @@ async def cb_my_purchases(query: CallbackQuery) -> None:
         return
 
     buttons = []
-    for o in orders:
+    for cat, count in category_counts.items():
+        name = PRODUCT_CATEGORIES.get(cat) or custom_category_names.get(cat) or cat.replace("_", " ").title()
+        buttons.append([apply_button_style(InlineKeyboardButton(
+            text=f"{name} ({count})",
+            callback_data=f"my_purchases_cat_{cat}|0",
+        ), 'primary', "5406683434124859552")])
+    buttons.append([apply_button_style(InlineKeyboardButton(text="Back", callback_data="back_main"), 'danger', "5416041192905265756")])
+
+    await query.message.edit_text(
+        "<tg-emoji emoji-id=\"5406683434124859552\">📦</tg-emoji> <b>My Purchases</b>\n\nSelect a category to view your purchases:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(F.data.startswith("my_purchases_cat_"))
+async def cb_my_purchases_cat(query: CallbackQuery) -> None:
+    """Show paginated purchases for a specific category."""
+    await query.answer()
+    # Format: my_purchases_cat_{category}|{page}
+    raw = query.data.replace("my_purchases_cat_", "")
+    parts = raw.split("|", 1)
+    category = parts[0]
+    try:
+        page = int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        page = 0
+
+    user_id = query.from_user.id
+    async with AsyncSessionFactory() as session:
+        ord_rows = await session.execute(
+            select(Order)
+            .where(Order.user_id == user_id, Order.status == "Completed")
+            .order_by(Order.created_at.desc())
+        )
+        all_orders = ord_rows.scalars().all()
+
+        product_ids = [o.product_id for o in all_orders]
+        products_map: dict[int, Product] = {}
+        if product_ids:
+            prod_rows = await session.execute(
+                select(Product).where(Product.id.in_(product_ids))
+            )
+            products_map = {p.id: p for p in prod_rows.scalars().all()}
+
+        category_name = PRODUCT_CATEGORIES.get(category, "")
+        if not category_name:
+            cc_res = await session.execute(
+                select(CustomCategory).where(CustomCategory.slug == category)
+            )
+            cc = cc_res.scalar_one_or_none()
+            category_name = cc.name if cc else category.replace("_", " ").title()
+
+    # Filter orders belonging to this category
+    cat_orders = [
+        o for o in all_orders
+        if products_map.get(o.product_id) and products_map[o.product_id].category == category
+    ]
+
+    if not cat_orders:
+        await query.message.edit_text(
+            "<tg-emoji emoji-id=\"5406683434124859552\">📦</tg-emoji> No purchases found in this category.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                apply_button_style(InlineKeyboardButton(text="Back", callback_data="my_purchases"), 'danger', "5416041192905265756"),
+            ]]),
+        )
+        return
+
+    total = len(cat_orders)
+    total_pages = (total + PURCHASES_PAGE_SIZE - 1) // PURCHASES_PAGE_SIZE
+    page = max(0, min(page, total_pages - 1))
+    start = page * PURCHASES_PAGE_SIZE
+    page_orders = cat_orders[start:start + PURCHASES_PAGE_SIZE]
+
+    buttons = []
+    for o in page_orders:
         p = products_map.get(o.product_id)
         phone = p.phone_number if p else f"Order #{o.id}"
         otp_icon = "✅" if (p and p.latest_otp) else "⏳"
@@ -6728,10 +6815,29 @@ async def cb_my_purchases(query: CallbackQuery) -> None:
             text=f"{otp_icon} {phone}",
             callback_data=f"purchase_detail_{o.id}",
         ), 'primary', "5406683434124859552")])
-    buttons.append([apply_button_style(InlineKeyboardButton(text="Back", callback_data="back_main"), 'danger', "5416041192905265756")])
+
+    # Pagination navigation row
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(apply_button_style(
+            InlineKeyboardButton(text="◀ Prev", callback_data=f"my_purchases_cat_{category}|{page - 1}"),
+            'primary', "5458603043203327669",
+        ))
+    if page < total_pages - 1:
+        nav_buttons.append(apply_button_style(
+            InlineKeyboardButton(text="Next ▶", callback_data=f"my_purchases_cat_{category}|{page + 1}"),
+            'primary', "5206607081334906820",
+        ))
+    if nav_buttons:
+        buttons.append(nav_buttons)
+
+    buttons.append([apply_button_style(InlineKeyboardButton(text="Back", callback_data="my_purchases"), 'danger', "5416041192905265756")])
 
     await query.message.edit_text(
-        "<tg-emoji emoji-id=\"5406683434124859552\">📦</tg-emoji> <b>My Purchases</b>\n\n<tg-emoji emoji-id=\"5206607081334906820\">✅</tg-emoji> = OTP received  <tg-emoji emoji-id=\"5458603043203327669\">⏳</tg-emoji> = Waiting for OTP",
+        f"<tg-emoji emoji-id=\"5406683434124859552\">📦</tg-emoji> <b>My Purchases – {category_name}</b>\n\n"
+        f"<tg-emoji emoji-id=\"5206607081334906820\">✅</tg-emoji> = OTP received  "
+        f"<tg-emoji emoji-id=\"5458603043203327669\">⏳</tg-emoji> = Waiting for OTP\n"
+        f"Page {page + 1} of {total_pages}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode=ParseMode.HTML,
     )
