@@ -1401,7 +1401,14 @@ class IsAdmin(BaseFilter):
 router = Router()
 
 
-# ── /start ────────────────────────────────────────────────────────────────────
+from aiogram.types import ReplyKeyboardRemove
+
+@router.message(Command("clean"))
+async def cmd_clean_keyboard(message: Message) -> None:
+    await message.answer(
+        "Old menu removed! ✅ You can go back to using /start.", 
+        reply_markup=ReplyKeyboardRemove()
+)# ── /start ────────────────────────────────────────────────────────────────────
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
