@@ -1354,6 +1354,7 @@ class AdminUserDiscountState(StatesGroup):
 class ZipIngest(StatesGroup):
     """FSM for the secondary admin ingestion bot zip-upload flow."""
     waiting_for_category   = State()   # Step 1: admin selects category via inline buttons
+    waiting_for_year       = State()   # Step 1b: year selection (only for telegram_old_accounts)
     waiting_for_price      = State()   # Step 2: admin enters price
     waiting_for_password   = State()   # Step 3: admin enters 2FA password or 0 to skip
     waiting_for_single_2fa = State()   # LEGACY: per-session 2FA prompt (kept for completeness)
@@ -2412,6 +2413,7 @@ async def cmd_buy(message: Message) -> None:
     kb_rows = [
         [apply_button_style(InlineKeyboardButton(text="Telegram Accounts", callback_data="buy_cat_telegram"), 'primary', "5197252827247841976")],
         [apply_button_style(InlineKeyboardButton(text="Telegram Sessions", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_SESSIONS}"), 'primary', "5197252827247841976")],
+        [apply_button_style(InlineKeyboardButton(text="WhatsApp SMS", callback_data=f"buy_cat_{CATEGORY_WHATSAPP_SMS}"), 'primary', "5197252827247841976")],
     ]
     for cc in custom_cats:
         cb = f"buy_custom_sub_{cc.slug}" if cc.sub_name else f"buy_cat_{cc.slug}"
@@ -2437,6 +2439,7 @@ async def cb_buy(query: CallbackQuery) -> None:
     kb_rows = [
         [apply_button_style(InlineKeyboardButton(text="Telegram Accounts", callback_data="buy_cat_telegram"), 'primary', "5197252827247841976")],
         [apply_button_style(InlineKeyboardButton(text="Telegram Sessions", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_SESSIONS}"), 'primary', "5197252827247841976")],
+        [apply_button_style(InlineKeyboardButton(text="WhatsApp SMS", callback_data=f"buy_cat_{CATEGORY_WHATSAPP_SMS}"), 'primary', "5197252827247841976")],
     ]
     for cc in custom_cats:
         cb = f"buy_custom_sub_{cc.slug}" if cc.sub_name else f"buy_cat_{cc.slug}"
@@ -8105,8 +8108,18 @@ async def _process_next_session_a(message: Message, state: FSMContext) -> None:
 
 
 async def _ingest_get_all_categories() -> list[tuple[str, str]]:
-    """Return list of (slug, display_name) for all built-in and custom categories."""
-    categories = list(PRODUCT_CATEGORIES.items())
+    """Return list of (slug, display_name) for all built-in and custom categories.
+
+    telegram_premium is excluded because its buy-flow relies on the PremiumCountry
+    table (not the Product table), so sessions ingested there would never appear
+    in the standard Buy Accounts menu.
+    """
+    _EXCLUDED_FROM_INGEST = {CATEGORY_TELEGRAM_PREMIUM}
+    categories = [
+        (slug, name)
+        for slug, name in PRODUCT_CATEGORIES.items()
+        if slug not in _EXCLUDED_FROM_INGEST
+    ]
     async with AsyncSessionFactory() as db:
         cc_rows = await db.execute(select(CustomCategory).order_by(CustomCategory.created_at))
         for cc in cc_rows.scalars().all():
@@ -8144,6 +8157,7 @@ async def _finish_ingest_category(
     category: str,
     price: Decimal,
     twofa_enc: Optional[str],
+    year: Optional[int] = None,
 ) -> None:
     """Insert all sessions into a single specified category and report results."""
     total_added = 0
@@ -8178,6 +8192,7 @@ async def _finish_ingest_category(
                 session_file_data=file_bytes,
                 twofa_password=twofa_enc,
                 status="Available",
+                year=year if category == CATEGORY_TELEGRAM_OLD else None,
             ))
             total_added += 1
             summary_lines.append(f"✅ {phone} — {flag} {country.title()}")
@@ -8197,11 +8212,13 @@ async def _finish_ingest_category(
             cc_res = await db.execute(select(CustomCategory).where(CustomCategory.slug == category))
             cc = cc_res.scalar_one_or_none()
             display_name = cc.name if cc else category.replace("_", " ").title()
+    year_line = f"📅 Year: <b>{year}</b>\n" if category == CATEGORY_TELEGRAM_OLD and year else ""
     lines_text = "\n".join(summary_lines[:50])
     extra = f"\n…and {len(summary_lines) - 50} more" if len(summary_lines) > 50 else ""
     await message.answer(
         f"<b>Ingestion complete</b>\n\n"
         f"📁 Category: <b>{display_name}</b>\n"
+        f"{year_line}"
         f"✅ Added: <b>{total_added}</b> record(s)\n"
         f"Price: <b>${price:.2f} USDT</b>\n\n"
         f"{lines_text}{extra}",
@@ -8312,13 +8329,62 @@ async def cb_ingest_category(query: CallbackQuery, state: FSMContext) -> None:
 
     selected_slug = cat_slugs[idx]
     await state.update_data(ingest_category=selected_slug)
-    await state.set_state(ZipIngest.waiting_for_price)
 
     display_name = PRODUCT_CATEGORIES.get(selected_slug, selected_slug.replace("_", " ").title())
+    await query.answer()
+
+    # Telegram Old Accounts require a creation year — ask for it before price
+    if selected_slug == CATEGORY_TELEGRAM_OLD:
+        await state.set_state(ZipIngest.waiting_for_year)
+        year_buttons: list[list[InlineKeyboardButton]] = []
+        row_yr: list[InlineKeyboardButton] = []
+        for yr in range(2013, 2026):
+            row_yr.append(InlineKeyboardButton(text=str(yr), callback_data=f"ic_yr_{yr}"))
+            if len(row_yr) == 4:
+                year_buttons.append(row_yr)
+                row_yr = []
+        if row_yr:
+            year_buttons.append(row_yr)
+        year_buttons.append([InlineKeyboardButton(text="❌ Cancel", callback_data="ic_cancel")])
+        await query.message.edit_text(
+            f"✅ Category: <b>{display_name}</b>\n\n"
+            f"📅 Select the <b>account creation year</b>:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=year_buttons),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await state.set_state(ZipIngest.waiting_for_price)
+    default_price = await get_default_session_price()
+    await query.message.edit_text(
+        f"✅ Category: <b>{display_name}</b>\n\n"
+        f"Enter the <b>price</b> for these sessions (e.g. <code>3.50</code>).\n"
+        f"Send <code>0</code> to use the default price (<b>${default_price:.2f} USDT</b>).\n\n"
+        f"Or send /cancel to abort.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@admin_router.callback_query(F.data.startswith("ic_yr_"))
+async def cb_ingest_year(query: CallbackQuery, state: FSMContext) -> None:
+    """Handle year selection for Telegram Old Accounts ingestion."""
+    if query.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        year = int(query.data.replace("ic_yr_", ""))
+    except ValueError:
+        await query.answer("Invalid year.", show_alert=True)
+        return
+
+    await state.update_data(ingest_year=year)
+    await state.set_state(ZipIngest.waiting_for_price)
+
     default_price = await get_default_session_price()
     await query.answer()
     await query.message.edit_text(
-        f"✅ Category: <b>{display_name}</b>\n\n"
+        f"✅ Category: <b>Telegram Old Accounts</b>\n"
+        f"📅 Year: <b>{year}</b>\n\n"
         f"Enter the <b>price</b> for these sessions (e.g. <code>3.50</code>).\n"
         f"Send <code>0</code> to use the default price (<b>${default_price:.2f} USDT</b>).\n\n"
         f"Or send /cancel to abort.",
@@ -8372,6 +8438,7 @@ async def admin_ingest_password(message: Message, state: FSMContext) -> None:
     category: str = data.get("ingest_category", CATEGORY_TELEGRAM_SESSIONS)
     price = Decimal(data.get("ingest_price", "2.00"))
     sessions_list: list[dict] = data.get("sessions_list", [])
+    year: Optional[int] = data.get("ingest_year")
     await state.clear()
 
     twofa_enc: Optional[str] = None
@@ -8383,7 +8450,7 @@ async def admin_ingest_password(message: Message, state: FSMContext) -> None:
         return
 
     await message.answer("⏳ Inserting sessions into database…")
-    await _finish_ingest_category(message, sessions_list, category, price, twofa_enc)
+    await _finish_ingest_category(message, sessions_list, category, price, twofa_enc, year=year)
 
 
 async def _handle_ingest_cancel(message: Message, state: FSMContext) -> bool:
