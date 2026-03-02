@@ -170,6 +170,40 @@ COUNTRY_FLAGS: dict[str, str] = {
     "dominican republic": "🇩🇴", "jamaica": "🇯🇲",
     "australia": "🇦🇺", "new zealand": "🇳🇿",
     "papua new guinea": "🇵🇬", "fiji": "🇫🇯",
+    # Additional European countries
+    "andorra": "🇦🇩", "liechtenstein": "🇱🇮", "monaco": "🇲🇨",
+    "san marino": "🇸🇲", "vatican": "🇻🇦", "malta": "🇲🇹",
+    "cyprus": "🇨🇾", "gibraltar": "🇬🇮", "faroe islands": "🇫🇴",
+    "greenland": "🇬🇱",
+    # Additional African countries
+    "benin": "🇧🇯", "togo": "🇹🇬", "guinea": "🇬🇳",
+    "sierra leone": "🇸🇱", "liberia": "🇱🇷", "guinea-bissau": "🇬🇼",
+    "cape verde": "🇨🇻", "gambia": "🇬🇲", "namibia": "🇳🇦",
+    "botswana": "🇧🇼", "eswatini": "🇸🇿", "swaziland": "🇸🇿",
+    "lesotho": "🇱🇸", "madagascar": "🇲🇬", "comoros": "🇰🇲",
+    "seychelles": "🇸🇨", "mauritius": "🇲🇺", "djibouti": "🇩🇯",
+    "eritrea": "🇪🇷", "malawi": "🇲🇼", "burundi": "🇧🇮",
+    "central african republic": "🇨🇫", "south sudan": "🇸🇸",
+    "republic of congo": "🇨🇬", "congo republic": "🇨🇬",
+    "gabon": "🇬🇦", "equatorial guinea": "🇬🇶",
+    "sao tome and principe": "🇸🇹", "são tomé and príncipe": "🇸🇹",
+    "mauritania": "🇲🇷",
+    # Additional Americas countries
+    "belize": "🇧🇿", "trinidad and tobago": "🇹🇹", "trinidad": "🇹🇹",
+    "barbados": "🇧🇧", "bahamas": "🇧🇸", "guyana": "🇬🇾",
+    "suriname": "🇸🇷", "grenada": "🇬🇩", "saint lucia": "🇱🇨",
+    "saint vincent and the grenadines": "🇻🇨", "saint vincent": "🇻🇨",
+    "antigua and barbuda": "🇦🇬", "antigua": "🇦🇬",
+    "saint kitts and nevis": "🇰🇳", "dominica": "🇩🇲",
+    "puerto rico": "🇵🇷",
+    # Additional Asia/Pacific countries
+    "maldives": "🇲🇻", "bhutan": "🇧🇹", "macau": "🇲🇴", "macao": "🇲🇴",
+    "timor-leste": "🇹🇱", "east timor": "🇹🇱",
+    "north korea": "🇰🇵",
+    "solomon islands": "🇸🇧", "vanuatu": "🇻🇺", "samoa": "🇼🇸",
+    "tonga": "🇹🇴", "kiribati": "🇰🇮", "marshall islands": "🇲🇭",
+    "palau": "🇵🇼", "micronesia": "🇫🇲", "nauru": "🇳🇷",
+    "tuvalu": "🇹🇻", "cook islands": "🇨🇰",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1319,8 +1353,11 @@ class AdminUserDiscountState(StatesGroup):
 
 class ZipIngest(StatesGroup):
     """FSM for the secondary admin ingestion bot zip-upload flow."""
-    waiting_for_single_2fa = State()   # Scenario A (<=5 sessions): per-session 2FA prompt
-    waiting_for_batch_2fa  = State()   # Scenario B (>5 sessions): single batch 2FA prompt
+    waiting_for_category   = State()   # Step 1: admin selects category via inline buttons
+    waiting_for_price      = State()   # Step 2: admin enters price
+    waiting_for_password   = State()   # Step 3: admin enters 2FA password or 0 to skip
+    waiting_for_single_2fa = State()   # LEGACY: per-session 2FA prompt (kept for completeness)
+    waiting_for_batch_2fa  = State()   # LEGACY: batch 2FA prompt (kept for completeness)
 
 class AdminCreateGiftCode(StatesGroup):
     amount         = State()
@@ -8037,7 +8074,6 @@ async def _process_next_session_a(message: Message, state: FSMContext) -> None:
     sessions_list: list[dict] = data["sessions_list"]
     current_index: int = data["current_index"]
     default_price = Decimal(data["default_price"])
-    new_2fa_pass = data.get("new_2fa_pass", DEFAULT_2FA_PASSWORD)
 
     while current_index < len(sessions_list):
         item = sessions_list[current_index]
@@ -8053,8 +8089,7 @@ async def _process_next_session_a(message: Message, state: FSMContext) -> None:
             await state.update_data(sessions_list=sessions_list, current_index=current_index)
             await message.answer(
                 f"🔐 2FA Detected for <code>+{item['phone']}</code>.\n\n"
-                f"Send the old 2FA password now. "
-                f"Password will be changed to <b>{new_2fa_pass}</b>.\n\n"
+                f"Send the 2FA password now (it will be stored as-is).\n\n"
                 f"Or send /cancel to abort ingestion.",
                 parse_mode=ParseMode.HTML,
             )
@@ -8069,15 +8104,114 @@ async def _process_next_session_a(message: Message, state: FSMContext) -> None:
     await _finish_ingestion(message, sessions_list, default_price)
 
 
+async def _ingest_get_all_categories() -> list[tuple[str, str]]:
+    """Return list of (slug, display_name) for all built-in and custom categories."""
+    categories = list(PRODUCT_CATEGORIES.items())
+    async with AsyncSessionFactory() as db:
+        cc_rows = await db.execute(select(CustomCategory).order_by(CustomCategory.created_at))
+        for cc in cc_rows.scalars().all():
+            categories.append((cc.slug, cc.name))
+    return categories
+
+
+async def _ingest_show_categories(message: Message, state: FSMContext) -> None:
+    """Send a category-selection inline keyboard to the admin."""
+    categories = await _ingest_get_all_categories()
+    cat_slugs = [slug for slug, _ in categories]
+    await state.update_data(ingest_cat_slugs=cat_slugs)
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for i, (slug, name) in enumerate(categories):
+        row.append(InlineKeyboardButton(text=name, callback_data=f"ic_{i}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton(text="❌ Cancel", callback_data="ic_cancel")])
+
+    await message.answer(
+        "📁 <b>Select a category</b> for the uploaded sessions:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _finish_ingest_category(
+    message: Message,
+    sessions_list: list[dict],
+    category: str,
+    price: Decimal,
+    twofa_enc: Optional[str],
+) -> None:
+    """Insert all sessions into a single specified category and report results."""
+    total_added = 0
+    summary_lines: list[str] = []
+
+    async with AsyncSessionFactory() as db:
+        for item in sessions_list:
+            phone = item["phone"]
+            raw = item.get("bytes")
+            if isinstance(raw, bytes):
+                file_bytes = raw
+            else:
+                file_bytes = b""
+            country = item.get("country", "unknown")
+            flag = get_country_flag(country)
+
+            existing = await db.execute(
+                select(Product).where(
+                    Product.phone_number == phone,
+                    Product.category == category,
+                )
+            )
+            if existing.scalar_one_or_none():
+                summary_lines.append(f"⚠️ {phone} — already in DB, skipped")
+                continue
+
+            db.add(Product(
+                category=category,
+                country=country,
+                phone_number=phone,
+                price=price,
+                session_file_data=file_bytes,
+                twofa_password=twofa_enc,
+                status="Available",
+            ))
+            total_added += 1
+            summary_lines.append(f"✅ {phone} — {flag} {country.title()}")
+
+        try:
+            await db.commit()
+        except Exception as exc:
+            log.error("DB error during category ingestion: %s", exc)
+            await message.answer(f"❌ DB error: {exc}", parse_mode=ParseMode.HTML)
+            return
+
+    # Resolve display name for the selected category
+    if category in PRODUCT_CATEGORIES:
+        display_name = PRODUCT_CATEGORIES[category]
+    else:
+        async with AsyncSessionFactory() as db:
+            cc_res = await db.execute(select(CustomCategory).where(CustomCategory.slug == category))
+            cc = cc_res.scalar_one_or_none()
+            display_name = cc.name if cc else category.replace("_", " ").title()
+    lines_text = "\n".join(summary_lines[:50])
+    extra = f"\n…and {len(summary_lines) - 50} more" if len(summary_lines) > 50 else ""
+    await message.answer(
+        f"<b>Ingestion complete</b>\n\n"
+        f"📁 Category: <b>{display_name}</b>\n"
+        f"✅ Added: <b>{total_added}</b> record(s)\n"
+        f"Price: <b>${price:.2f} USDT</b>\n\n"
+        f"{lines_text}{extra}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 @admin_router.message(F.document)
 async def admin_ingest_file(message: Message, state: FSMContext) -> None:
-    """Receive .zip or .session file and process with appropriate 2FA flow.
-
-    * Scenario A (≤5 sessions): check 2FA per session, pause for each that
-      requires a password (waiting_for_single_2fa state).
-    * Scenario B (>5 sessions): check 2FA on the *first* session only; if
-      enabled, ask for a single batch password (waiting_for_batch_2fa state).
-    """
+    """Receive .zip or .session file, parse sessions, and prompt for category selection."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
@@ -8102,9 +8236,6 @@ async def admin_ingest_file(message: Message, state: FSMContext) -> None:
         await message.answer(f"❌ Failed to download file: {exc}")
         return
 
-    default_price = await get_default_session_price()
-    new_2fa_pass = await get_default_2fa_password()
-
     # Build list of session dicts from the upload
     sessions_list: list[dict] = []
 
@@ -8114,7 +8245,7 @@ async def admin_ingest_file(message: Message, state: FSMContext) -> None:
             await message.answer("⚠️ Could not extract a phone number from the filename.")
             return
         country = detect_country_from_phone(phone)
-        sessions_list.append({"phone": phone, "bytes": raw_bytes, "country": country, "has_2fa": False, "password": None})
+        sessions_list.append({"phone": phone, "bytes": raw_bytes, "country": country, "password": None})
 
     elif fname_lower.endswith(".zip"):
         try:
@@ -8128,7 +8259,7 @@ async def admin_ingest_file(message: Message, state: FSMContext) -> None:
                             try:
                                 session_bytes = zf.read(name)
                                 country = detect_country_from_phone(phone)
-                                sessions_list.append({"phone": phone, "bytes": session_bytes, "country": country, "has_2fa": False, "password": None})
+                                sessions_list.append({"phone": phone, "bytes": session_bytes, "country": country, "password": None})
                             except Exception as exc:
                                 await message.answer(f"❌ {base} — read error: {exc}")
         except zipfile.BadZipFile:
@@ -8145,51 +8276,114 @@ async def admin_ingest_file(message: Message, state: FSMContext) -> None:
 
     total_sessions = len(sessions_list)
     await message.answer(
-        f"📦 Found <b>{total_sessions}</b> session file(s). "
-        f"{'Checking each individually…' if total_sessions <= _INGEST_BATCH_THRESHOLD else 'Batch mode — checking first session for 2FA…'}",
+        f"📦 Found <b>{total_sessions}</b> session file(s).\n\nNow select a category:",
         parse_mode=ParseMode.HTML,
     )
 
-    if total_sessions <= _INGEST_BATCH_THRESHOLD:
-        # ── Scenario A: individual per-session 2FA checking ──────────────────
-        await state.update_data(
-            sessions_list=sessions_list,
-            current_index=0,
-            default_price=str(default_price),
-            new_2fa_pass=new_2fa_pass,
-        )
-        await _process_next_session_a(message, state)
+    # Store sessions in FSM and show category selection
+    await state.update_data(sessions_list=sessions_list)
+    await state.set_state(ZipIngest.waiting_for_category)
+    await _ingest_show_categories(message, state)
 
-    else:
-        # ── Scenario B: check only the first session ─────────────────────────
-        first = sessions_list[0]
-        await message.answer(
-            f"🔍 Checking 2FA for <code>+{first['phone']}</code> (1/{total_sessions})…",
-            parse_mode=ParseMode.HTML,
-        )
-        has_2fa = await check_2fa_with_session_file(first["phone"], first["bytes"])
-        sessions_list[0]["has_2fa"] = has_2fa
 
-        if has_2fa:
-            await state.update_data(
-                sessions_list=sessions_list,
-                default_price=str(default_price),
-                new_2fa_pass=new_2fa_pass,
-            )
-            await message.answer(
-                f"🔐 2FA Detected for <code>+{first['phone']}</code>.\n\n"
-                f"⚠️ Batch mode: <b>{total_sessions}</b> sessions detected. "
-                f"All sessions must share the same 2FA password.\n\n"
-                f"Send the old 2FA password now. "
-                f"Password will be changed to <b>{new_2fa_pass}</b>.\n\n"
-                f"Or send /cancel to abort ingestion.",
-                parse_mode=ParseMode.HTML,
-            )
-            await state.set_state(ZipIngest.waiting_for_batch_2fa)
+@admin_router.callback_query(F.data.startswith("ic_"))
+async def cb_ingest_category(query: CallbackQuery, state: FSMContext) -> None:
+    """Handle category selection for session ingestion."""
+    if query.from_user.id not in ADMIN_IDS:
+        return
+
+    if query.data == "ic_cancel":
+        await state.clear()
+        await query.answer()
+        await query.message.edit_text("❌ Ingestion cancelled.")
+        return
+
+    try:
+        idx = int(query.data[3:])
+    except (ValueError, IndexError):
+        await query.answer("Invalid selection.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    cat_slugs: list[str] = data.get("ingest_cat_slugs", [])
+    if idx < 0 or idx >= len(cat_slugs):
+        await query.answer("Invalid selection.", show_alert=True)
+        return
+
+    selected_slug = cat_slugs[idx]
+    await state.update_data(ingest_category=selected_slug)
+    await state.set_state(ZipIngest.waiting_for_price)
+
+    display_name = PRODUCT_CATEGORIES.get(selected_slug, selected_slug.replace("_", " ").title())
+    default_price = await get_default_session_price()
+    await query.answer()
+    await query.message.edit_text(
+        f"✅ Category: <b>{display_name}</b>\n\n"
+        f"Enter the <b>price</b> for these sessions (e.g. <code>3.50</code>).\n"
+        f"Send <code>0</code> to use the default price (<b>${default_price:.2f} USDT</b>).\n\n"
+        f"Or send /cancel to abort.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@admin_router.message(ZipIngest.waiting_for_price)
+async def admin_ingest_price(message: Message, state: FSMContext) -> None:
+    """Receive price for the ingested sessions."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    if await _handle_ingest_cancel(message, state):
+        return
+
+    raw = message.text.strip() if message.text else ""
+    try:
+        parsed = Decimal(raw)
+        if parsed < 0:
+            raise ValueError("Price must be non-negative")
+        if parsed == 0:
+            price = await get_default_session_price()
         else:
-            # No 2FA on first — insert all without password
-            await message.answer("⏳ No 2FA detected on first account. Inserting all sessions…")
-            await _finish_ingestion(message, sessions_list, default_price)
+            price = parsed
+    except Exception:
+        await message.answer("❌ Invalid price. Enter a positive number or <code>0</code> for default:", parse_mode=ParseMode.HTML)
+        return
+
+    await state.update_data(ingest_price=str(price))
+    await state.set_state(ZipIngest.waiting_for_password)
+    await message.answer(
+        f"💰 Price: <b>${price:.2f} USDT</b>\n\n"
+        f"Enter the <b>2FA password</b> for these accounts, or send <code>0</code> to skip.\n\n"
+        f"Or send /cancel to abort.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@admin_router.message(ZipIngest.waiting_for_password)
+async def admin_ingest_password(message: Message, state: FSMContext) -> None:
+    """Receive 2FA password (or 0 to skip) and finalize ingestion."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    if await _handle_ingest_cancel(message, state):
+        return
+
+    raw = message.text.strip() if message.text else "0"
+    data = await state.get_data()
+    category: str = data.get("ingest_category", CATEGORY_TELEGRAM_SESSIONS)
+    price = Decimal(data.get("ingest_price", "2.00"))
+    sessions_list: list[dict] = data.get("sessions_list", [])
+    await state.clear()
+
+    twofa_enc: Optional[str] = None
+    if raw != "0":
+        twofa_enc = encrypt_privkey(raw)
+
+    if not sessions_list:
+        await message.answer("❌ No session data found. Please upload the file again.")
+        return
+
+    await message.answer("⏳ Inserting sessions into database…")
+    await _finish_ingest_category(message, sessions_list, category, price, twofa_enc)
 
 
 async def _handle_ingest_cancel(message: Message, state: FSMContext) -> bool:
@@ -8203,60 +8397,30 @@ async def _handle_ingest_cancel(message: Message, state: FSMContext) -> bool:
 
 @admin_router.message(ZipIngest.waiting_for_single_2fa)
 async def admin_ingest_single_2fa_password(message: Message, state: FSMContext) -> None:
-    """Scenario A: receive old 2FA password, change it to the default, then continue."""
+    """LEGACY: receive 2FA password, store as-is, then continue to next session."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
     if await _handle_ingest_cancel(message, state):
         return
 
-    old_password = message.text.strip() if message.text else ""
-    if not old_password:
-        await message.answer("⚠️ Please enter the old 2FA password or send /cancel to abort.")
+    password = message.text.strip() if message.text else ""
+    if not password:
+        await message.answer("⚠️ Please enter the 2FA password or send /cancel to abort.")
         return
 
     data = await state.get_data()
     sessions_list: list[dict] = data["sessions_list"]
     current_index: int = data["current_index"]
-    new_2fa_pass: str = data.get("new_2fa_pass", DEFAULT_2FA_PASSWORD)
+    default_price = Decimal(data.get("default_price", "2.00"))
     item = sessions_list[current_index]
 
+    # Store the provided password as-is (no password change attempted)
+    sessions_list[current_index]["password"] = password
     await message.answer(
-        f"🔄 Verifying old password and changing 2FA for <code>+{item['phone']}</code>…",
+        f"✅ Password stored for <code>+{item['phone']}</code>.",
         parse_mode=ParseMode.HTML,
     )
-
-    ok, result_msg = await change_2fa_password(item["bytes"], old_password, new_2fa_pass)
-
-    if result_msg == "wrong_password":
-        await message.answer(
-            f"❌ Wrong 2FA password for <code>+{item['phone']}</code>.\n\n"
-            f"Please enter the correct old 2FA password, or send /cancel to abort.",
-            parse_mode=ParseMode.HTML,
-        )
-        return  # Stay in waiting_for_single_2fa, let admin retry
-
-    if not ok:
-        await message.answer(
-            f"⚠️ Could not change 2FA for <code>+{item['phone']}</code>: {result_msg}\n\n"
-            f"Storing the provided password as-is and continuing.",
-            parse_mode=ParseMode.HTML,
-        )
-        # Fall back: store the old password the admin supplied
-        sessions_list[current_index]["password"] = old_password
-    else:
-        if result_msg == "no_2fa":
-            await message.answer(
-                f"ℹ️ <code>+{item['phone']}</code> has no 2FA — no change needed.",
-                parse_mode=ParseMode.HTML,
-            )
-            sessions_list[current_index]["password"] = None
-        else:
-            await message.answer(
-                f"✅ 2FA password changed to <b>{new_2fa_pass}</b> for <code>+{item['phone']}</code>.",
-                parse_mode=ParseMode.HTML,
-            )
-            sessions_list[current_index]["password"] = new_2fa_pass
 
     current_index += 1
     await state.update_data(sessions_list=sessions_list, current_index=current_index)
@@ -8265,22 +8429,21 @@ async def admin_ingest_single_2fa_password(message: Message, state: FSMContext) 
 
 @admin_router.message(ZipIngest.waiting_for_batch_2fa)
 async def admin_ingest_batch_2fa_password(message: Message, state: FSMContext) -> None:
-    """Scenario B: receive old 2FA password, change it on all sessions, then ingest."""
+    """LEGACY: receive batch 2FA password, store as-is for all sessions, then ingest."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
     if await _handle_ingest_cancel(message, state):
         return
 
-    old_password = message.text.strip() if message.text else ""
-    if not old_password:
-        await message.answer("⚠️ Please enter the batch 2FA password or send /cancel to abort.")
+    password = message.text.strip() if message.text else ""
+    if not password:
+        await message.answer("⚠️ Please enter the 2FA password or send /cancel to abort.")
         return
 
     data = await state.get_data()
     sessions_list: list[dict] = data.get("sessions_list", [])
     default_price = Decimal(data.get("default_price", "1.00"))
-    new_2fa_pass: str = data.get("new_2fa_pass", DEFAULT_2FA_PASSWORD)
 
     await state.clear()
 
@@ -8288,47 +8451,9 @@ async def admin_ingest_batch_2fa_password(message: Message, state: FSMContext) -
         await message.answer("❌ No session data found. Please upload the file again.")
         return
 
-    total = len(sessions_list)
-    await message.answer(
-        f"🔄 Changing 2FA password for <b>{total}</b> session(s). This may take a moment…",
-        parse_mode=ParseMode.HTML,
-    )
-
-    changed_ok = 0
-    changed_fail = 0
+    # Store the provided password as-is for all sessions
     for item in sessions_list:
-        if not item.get("has_2fa"):
-            item["password"] = None
-            continue
-
-        ok, result_msg = await change_2fa_password(item["bytes"], old_password, new_2fa_pass)
-        if result_msg == "wrong_password":
-            await message.answer(
-                f"❌ Wrong 2FA password for <code>+{item['phone']}</code>. "
-                f"Skipping this account.",
-                parse_mode=ParseMode.HTML,
-            )
-            item["password"] = None
-            changed_fail += 1
-        elif not ok:
-            await message.answer(
-                f"⚠️ Could not change 2FA for <code>+{item['phone']}</code>: {result_msg}. "
-                f"Storing provided password as-is.",
-                parse_mode=ParseMode.HTML,
-            )
-            item["password"] = old_password
-            changed_fail += 1
-        elif result_msg == "no_2fa":
-            item["password"] = None
-        else:
-            item["password"] = new_2fa_pass
-            changed_ok += 1
-
-    if changed_ok or changed_fail:
-        await message.answer(
-            f"🔐 2FA change results: ✅ {changed_ok} changed, ❌ {changed_fail} failed.",
-            parse_mode=ParseMode.HTML,
-        )
+        item["password"] = password
 
     await message.answer("⏳ Inserting accounts into database…")
     await _finish_ingestion(message, sessions_list, default_price)
@@ -8383,8 +8508,7 @@ async def admin_set_2fa_pass(message: Message) -> None:
         return
     await set_default_2fa_password(new_pass)
     await message.answer(
-        f"✅ Default 2FA password set to <b>{new_pass}</b>.\n\n"
-        f"New sessions with 2FA will have their password changed to this value during ingestion.",
+        f"✅ Default 2FA password set to <b>{new_pass}</b>.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -8394,16 +8518,17 @@ async def admin_bot_start(message: Message) -> None:
     if message.from_user.id not in ADMIN_IDS:
         return
     current_price = await get_default_session_price()
-    current_2fa = await get_default_2fa_password()
     await message.answer(
         f"<b>Session Ingestion Bot</b>\n\n"
-        f"Upload a <b>.session</b> file or a <b>.zip</b> archive of session files and "
-        f"they will be automatically added to the marketplace database.\n\n"
-        f"Current default session price: <b>${current_price:.2f} USDT</b>\n"
-        f"Current default 2FA password: <b>{current_2fa}</b>\n\n"
+        f"Upload a <b>.session</b> file or a <b>.zip</b> archive of session files.\n"
+        f"The bot will ask you to:\n"
+        f"  1️⃣ Select a <b>category</b> (inline buttons)\n"
+        f"  2️⃣ Enter a <b>price</b> (or <code>0</code> for default)\n"
+        f"  3️⃣ Enter the <b>2FA password</b> (or <code>0</code> to skip)\n\n"
+        f"Current default session price: <b>${current_price:.2f} USDT</b>\n\n"
         f"Commands:\n"
         f"• <code>/setprice &lt;amount&gt;</code> — set default price for new sessions\n"
-        f"• <code>/set2fapass &lt;password&gt;</code> — set default 2FA replacement password",
+        f"• <code>/cancel</code> — cancel the current operation",
         parse_mode=ParseMode.HTML,
     )
 
