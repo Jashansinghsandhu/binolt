@@ -623,9 +623,15 @@ _PHONE_PREFIX_MAP: list[tuple[str, str]] = [
     ("353", "ireland"), ("352", "luxembourg"), ("351", "portugal"),
     ("350", "gibraltar"), ("389", "north macedonia"), ("387", "bosnia"),
     ("386", "slovenia"), ("385", "croatia"), ("382", "montenegro"),
-    ("381", "serbia"), ("48", "poland"), ("47", "norway"),
+    ("381", "serbia"), ("359", "bulgaria"), ("376", "andorra"),
+    ("377", "monaco"), ("378", "san marino"), ("383", "kosovo"),
+    ("423", "liechtenstein"),
+    ("299", "greenland"), ("298", "faroe islands"),
+    ("49", "germany"), ("48", "poland"), ("47", "norway"),
     ("46", "sweden"), ("45", "denmark"), ("44", "united kingdom"),
-    ("43", "austria"), ("420", "czech republic"), ("421", "slovakia"),
+    ("43", "austria"), ("41", "switzerland"),
+    ("40", "romania"), ("39", "italy"), ("420", "czech republic"),
+    ("421", "slovakia"),
     ("36", "hungary"), ("34", "spain"), ("33", "france"),
     ("32", "belgium"), ("31", "netherlands"), ("30", "greece"),
     ("27", "south africa"), ("20", "egypt"),
@@ -634,6 +640,8 @@ _PHONE_PREFIX_MAP: list[tuple[str, str]] = [
     ("249", "sudan"), ("234", "nigeria"), ("233", "ghana"),
     ("225", "ivory coast"), ("222", "mauritania"), ("221", "senegal"),
     ("216", "tunisia"), ("213", "algeria"), ("212", "morocco"),
+    ("58", "venezuela"), ("57", "colombia"), ("56", "chile"),
+    ("55", "brazil"), ("54", "argentina"), ("52", "mexico"),
     ("1", "united states"),
     ("7", "russia"),
     ("81", "japan"), ("82", "south korea"), ("84", "vietnam"),
@@ -8303,7 +8311,7 @@ async def admin_ingest_file(message: Message, state: FSMContext) -> None:
     await _ingest_show_categories(message, state)
 
 
-@admin_router.callback_query(F.data.startswith("ic_"))
+@admin_router.callback_query(F.data.startswith("ic_") & ~F.data.startswith("ic_yr_"))
 async def cb_ingest_category(query: CallbackQuery, state: FSMContext) -> None:
     """Handle category selection for session ingestion."""
     if query.from_user.id not in ADMIN_IDS:
