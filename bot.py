@@ -425,6 +425,7 @@ class PremiumOrder(Base):
     user_id        = Column(BigInteger, nullable=False)
     country        = Column(String(64), nullable=False)
     price          = Column(Numeric(18, 6), nullable=False)
+    quantity       = Column(Integer, default=1)
     status         = Column(String(16), default="Pending")
     phone_number   = Column(String(32), nullable=True)
     session_string = Column(Text, nullable=True)
@@ -477,6 +478,7 @@ async def init_db() -> None:
             "ALTER TABLE products ADD COLUMN session_file_data BLOB",
             "CREATE TABLE IF NOT EXISTS settings (key VARCHAR(64) PRIMARY KEY, value TEXT, updated_at DATETIME)",
             "CREATE TABLE IF NOT EXISTS referral_benefits (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id BIGINT NOT NULL UNIQUE, discount_uses_remaining INTEGER DEFAULT 0, free_purchases_remaining INTEGER DEFAULT 0, discount_granted BOOLEAN DEFAULT 0, free_granted BOOLEAN DEFAULT 0, updated_at DATETIME)",
+            "ALTER TABLE premium_orders ADD COLUMN quantity INTEGER DEFAULT 1",
         ]
         for migration in migrations:
             try:
@@ -1398,8 +1400,8 @@ class AdminAddPremiumCountry(StatesGroup):
 
 
 class AdminFulfillPremiumOrder(StatesGroup):
-    session_file   = State()
-    twofa_password = State()
+    collecting_files = State()   # Waiting for .session/.zip file(s)
+    twofa_password   = State()   # Waiting for 2FA for current file
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3824,15 +3826,83 @@ async def cb_buy_prem_country(query: CallbackQuery) -> None:
     await query.message.edit_text(
         f"<tg-emoji emoji-id=\"5453901475648390219\">⭐</tg-emoji> <b>Telegram Premium</b>\n\n"
         f"<tg-emoji emoji-id=\"5460755126761312667\">🌍</tg-emoji> <b>Country:</b> {flag} {pc.country.title()}\n"
-        f"<tg-emoji emoji-id=\"5409048419211682843\">💵</tg-emoji> <b>Price:</b> ${price:.2f} USDT\n"
+        f"<tg-emoji emoji-id=\"5409048419211682843\">💵</tg-emoji> <b>Price per Account:</b> ${price:.2f} USDT\n"
         f"<tg-emoji emoji-id=\"5409048419211682843\">💰</tg-emoji> <b>Your Balance:</b> ${user_balance:.2f} USDT\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Your order will be completed within <b>24 hours</b>.\n"
-        f"You'll receive the account details once ready.",
+        f"<tg-emoji emoji-id=\"5406683434124859552\">🛒</tg-emoji> <b>Select Quantity:</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [apply_button_style(InlineKeyboardButton(text="Confirm Order", callback_data=f"buy_prem_confirm_{country_id}"), 'success', "5206607081334906820")],
+            [
+                apply_button_style(InlineKeyboardButton(text="✅ × 1", callback_data=f"buy_prem_qty_{country_id}|1"), 'success', "5206607081334906820"),
+                apply_button_style(InlineKeyboardButton(text="✅ × 2", callback_data=f"buy_prem_qty_{country_id}|2"), 'success', "5206607081334906820"),
+                apply_button_style(InlineKeyboardButton(text="✅ × 3", callback_data=f"buy_prem_qty_{country_id}|3"), 'success', "5206607081334906820"),
+            ],
+            [
+                apply_button_style(InlineKeyboardButton(text="✅ × 5", callback_data=f"buy_prem_qty_{country_id}|5"), 'success', "5206607081334906820"),
+                apply_button_style(InlineKeyboardButton(text="✅ × 10", callback_data=f"buy_prem_qty_{country_id}|10"), 'success', "5206607081334906820"),
+            ],
             [apply_button_style(InlineKeyboardButton(text="Cancel", callback_data="buy_prem"), 'danger', "5416041192905265756")],
         ]),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+
+@router.callback_query(F.data.startswith("buy_prem_qty_"))
+async def cb_buy_prem_qty(query: CallbackQuery) -> None:
+    """Show order confirmation for a chosen premium quantity."""
+    await query.answer()
+    try:
+        raw = query.data.replace("buy_prem_qty_", "")
+        country_id_str, qty_str = raw.split("|", 1)
+        country_id = int(country_id_str)
+        qty = int(qty_str)
+        if qty <= 0:
+            raise ValueError
+    except (ValueError, IndexError):
+        await query.answer("Invalid request", show_alert=True)
+        return
+
+    async with AsyncSessionFactory() as session:
+        res = await session.execute(select(PremiumCountry).where(PremiumCountry.id == country_id))
+        pc = res.scalar_one_or_none()
+    if pc is None:
+        await query.answer("Country not found.", show_alert=True)
+        return
+
+    user_id = query.from_user.id
+    async with AsyncSessionFactory() as session:
+        u_res = await session.execute(select(User).where(User.id == user_id))
+        u_obj = u_res.scalar_one_or_none()
+        user_balance = Decimal(str(u_obj.balance or 0)) if u_obj else Decimal("0")
+
+    flag = get_country_flag(pc.country)
+    price_each = Decimal(str(pc.price))
+    total_price = price_each * qty
+
+    balance_ok = user_balance >= total_price
+    confirm_btn = apply_button_style(
+        InlineKeyboardButton(text=f"✅ Confirm Order ×{qty}", callback_data=f"buy_prem_confirm_{country_id}|{qty}"),
+        'success', "5206607081334906820"
+    )
+    deposit_btn = apply_button_style(
+        InlineKeyboardButton(text="Deposit", callback_data="deposit"),
+        'primary', "5424976816530014958"
+    )
+    kb_rows = [[confirm_btn] if balance_ok else [deposit_btn]]
+    kb_rows.append([apply_button_style(InlineKeyboardButton(text="Back", callback_data=f"buy_prem_ctry_{country_id}"), 'danger', "5416041192905265756")])
+
+    await query.message.edit_text(
+        f"<tg-emoji emoji-id=\"5453901475648390219\">⭐</tg-emoji> <b>Telegram Premium — Order Summary</b>\n\n"
+        f"<tg-emoji emoji-id=\"5460755126761312667\">🌍</tg-emoji> <b>Country:</b> {flag} {pc.country.title()}\n"
+        f"<tg-emoji emoji-id=\"5197252827247841976\">📱</tg-emoji> <b>Quantity:</b> {qty}\n"
+        f"<tg-emoji emoji-id=\"5409048419211682843\">💵</tg-emoji> <b>Price per Account:</b> ${price_each:.2f} USDT\n"
+        f"<tg-emoji emoji-id=\"5197434882321567830\">💰</tg-emoji> <b>Total:</b> ${total_price:.2f} USDT\n"
+        f"<tg-emoji emoji-id=\"5409048419211682843\">💳</tg-emoji> <b>Your Balance:</b> ${user_balance:.2f} USDT\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Your order will be completed within <b>24 hours</b>.\n"
+        f"You'll receive the account details once ready."
+        + ("" if balance_ok else f"\n\n❌ <b>Insufficient balance.</b> Need ${total_price - user_balance:.2f} more."),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
         parse_mode=ParseMode.HTML,
     )
 
@@ -3842,7 +3912,16 @@ async def cb_buy_prem_confirm(query: CallbackQuery) -> None:
     """Process premium order placement."""
     await query.answer()
     try:
-        country_id = int(query.data.replace("buy_prem_confirm_", ""))
+        raw = query.data.replace("buy_prem_confirm_", "")
+        if "|" in raw:
+            country_id_str, qty_str = raw.split("|", 1)
+            country_id = int(country_id_str)
+            qty = int(qty_str)
+        else:
+            country_id = int(raw)
+            qty = 1
+        if qty <= 0:
+            raise ValueError
     except ValueError:
         await query.answer("Invalid request", show_alert=True)
         return
@@ -3861,12 +3940,13 @@ async def cb_buy_prem_confirm(query: CallbackQuery) -> None:
             await query.answer("🚫 You are banned.", show_alert=True)
             return
 
-        price = Decimal(str(pc.price))
-        if Decimal(str(user.balance)) < price:
+        price_each = Decimal(str(pc.price))
+        total_price = price_each * qty
+        if Decimal(str(user.balance)) < total_price:
             await query.message.edit_text(
                 f"❌ <b>Insufficient Balance</b>\n\n"
                 f"💰 Your balance: <b>${user.balance:.2f}</b>\n"
-                f"💵 Required: <b>${price:.2f}</b>\n\n"
+                f"💵 Required: <b>${total_price:.2f}</b>\n\n"
                 f"Please deposit funds first.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [apply_button_style(InlineKeyboardButton(text="Deposit", callback_data="deposit"), 'primary', "5424976816530014958")],
@@ -3876,9 +3956,9 @@ async def cb_buy_prem_confirm(query: CallbackQuery) -> None:
             )
             return
 
-        # Deduct balance
+        # Deduct balance (total for all qty accounts)
         await session.execute(
-            update(User).where(User.id == user_id).values(balance=User.balance - price)
+            update(User).where(User.id == user_id).values(balance=User.balance - total_price)
         )
 
         # Create order
@@ -3887,7 +3967,8 @@ async def cb_buy_prem_confirm(query: CallbackQuery) -> None:
             order_ref=order_ref,
             user_id=user_id,
             country=pc.country,
-            price=price,
+            price=total_price,
+            quantity=qty,
             status="Pending",
         )
         session.add(prem_order)
@@ -3897,7 +3978,7 @@ async def cb_buy_prem_confirm(query: CallbackQuery) -> None:
         txn = Transaction(
             user_id=user_id,
             type="Purchase",
-            amount=price,
+            amount=total_price,
             status="Pending",
         )
         session.add(txn)
@@ -3911,10 +3992,11 @@ async def cb_buy_prem_confirm(query: CallbackQuery) -> None:
         f"<tg-emoji emoji-id='5235711785482341993'>🎉</tg-emoji> <b>Order Placed Successfully!</b>\n\n"
         f"<tg-emoji emoji-id='5397782960512444700'>📌</tg-emoji> <b>Order ID:</b> <code>{order_ref}</code>\n"
         f"<tg-emoji emoji-id='5224450179368767019'>🌍</tg-emoji> <b>Country:</b> {flag} {country_name.title()}\n"
-        f"<tg-emoji emoji-id='5197434882321567830'>💵</tg-emoji> <b>Price Paid:</b> ${price:.2f} USDT\n"
+        f"<tg-emoji emoji-id='5197252827247841976'>📱</tg-emoji> <b>Quantity:</b> {qty}\n"
+        f"<tg-emoji emoji-id='5197434882321567830'>💵</tg-emoji> <b>Total Paid:</b> ${total_price:.2f} USDT\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"<tg-emoji emoji-id='5456140674028019486'>⚡</tg-emoji> Your order will be completed within <b>24 hours</b>.\n"
-        f"We will notify you once your account is ready!",
+        f"We will notify you once your account(s) are ready!",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             apply_button_style(InlineKeyboardButton(text="Main Menu", callback_data="back_main"), 'danger', "5416041192905265756"),
         ]]),
@@ -3928,15 +4010,16 @@ async def cb_buy_prem_confirm(query: CallbackQuery) -> None:
     admin_text = (
         f"🆕 <b>New Premium Order!</b>\n\n"
         f"📌 <b>Order ID:</b> {order_ref}\n"
-        f"👤 <b>User:</b> {user_display}\n"
+        f"👤 <b>User:</b> {user_display} (<code>{user_id}</code>)\n"
         f"🌍 <b>Country:</b> {flag} {country_name.title()}\n"
-        f"💵 <b>Price:</b> ${price:.2f} USDT\n"
+        f"📱 <b>Quantity:</b> {qty}\n"
+        f"💵 <b>Total Price:</b> ${total_price:.2f} USDT\n"
         f"⏰ {dt_str}"
     )
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            apply_button_style(InlineKeyboardButton(text="Confirm", callback_data=f"prem_admin_confirm_{order_ref}"), 'success', "5206607081334906820"),
-            apply_button_style(InlineKeyboardButton(text="Decline", callback_data=f"prem_admin_decline_{order_ref}"), 'danger', "5416041192905265756"),
+            apply_button_style(InlineKeyboardButton(text="✅ Confirm", callback_data=f"prem_admin_confirm_{order_ref}"), 'success', "5206607081334906820"),
+            apply_button_style(InlineKeyboardButton(text="❌ Decline", callback_data=f"prem_admin_decline_{order_ref}"), 'danger', "5416041192905265756"),
         ]
     ])
     for admin_id in ADMIN_IDS:
@@ -3950,7 +4033,7 @@ async def cb_buy_prem_confirm(query: CallbackQuery) -> None:
         _log_user_res = await _log_session.execute(select(User).where(User.id == user_id))
         _log_user_obj = _log_user_res.scalar_one_or_none()
         _total_dep = Decimal(str(_log_user_obj.total_deposited or 0)) if _log_user_obj else Decimal("0")
-    await post_to_log_channel(query.bot, user_display, CATEGORY_TELEGRAM_PREMIUM, country_name, price, "Pending", user_id=user_id, total_deposited=_total_dep)
+    await post_to_log_channel(query.bot, user_display, CATEGORY_TELEGRAM_PREMIUM, country_name, total_price, "Pending", user_id=user_id, total_deposited=_total_dep)
 
 
 @router.callback_query(F.data.startswith("prem_admin_confirm_"))
@@ -3959,43 +4042,117 @@ async def cb_prem_admin_confirm(query: CallbackQuery, state: FSMContext) -> None
     """Admin confirms a premium order - starts fulfillment FSM."""
     await query.answer()
     order_ref = query.data.replace("prem_admin_confirm_", "")
-    await state.set_state(AdminFulfillPremiumOrder.session_file)
-    await state.update_data(prem_order_ref=order_ref)
+
+    async with AsyncSessionFactory() as session:
+        res = await session.execute(select(PremiumOrder).where(PremiumOrder.order_ref == order_ref))
+        prem_order = res.scalar_one_or_none()
+
+    if prem_order is None:
+        await query.answer("Order not found.", show_alert=True)
+        return
+    if prem_order.status != "Pending":
+        await query.answer("Order already processed.", show_alert=True)
+        return
+
+    qty = int(prem_order.quantity or 1)
+    await state.set_state(AdminFulfillPremiumOrder.collecting_files)
+    await state.update_data(prem_order_ref=order_ref, prem_qty=qty, prem_collected=[])
     await query.message.answer(
-        f"📌 Fulfilling Premium Order <code>{order_ref}</code>\n\n"
-        f"Upload the <b>.session file</b> for this order as a document.\n"
-        f"The file name should be <code>+phonenumber.session</code> (e.g. <code>+12345678900.session</code>).",
+        f"📌 Fulfilling Premium Order <code>{order_ref}</code> — <b>{qty} account(s)</b>\n\n"
+        f"Upload <b>.session file(s)</b> one by one (or a <b>.zip</b> file containing all sessions).\n"
+        f"File name format: <code>+phonenumber.session</code>\n\n"
+        f"<b>Progress: 0 / {qty} received</b>",
         parse_mode=ParseMode.HTML,
     )
 
 
-@router.message(AdminFulfillPremiumOrder.session_file)
+@router.message(AdminFulfillPremiumOrder.collecting_files)
 @admin_only
-async def fsm_prem_fulfill_session_file(message: Message, state: FSMContext) -> None:
-    """Handle .session file upload for premium order fulfillment."""
+async def fsm_prem_collect_files(message: Message, state: FSMContext) -> None:
+    """Handle .session or .zip file uploads for premium order fulfillment."""
+    data = await state.get_data()
+    order_ref: str = data["prem_order_ref"]
+    qty: int = data["prem_qty"]
+    collected: list = data.get("prem_collected", [])
+
     if not message.document:
         await message.answer(
-            "❌ Please upload the <b>.session file</b> as a document attachment.",
+            "❌ Please upload a <b>.session</b> file (or a <b>.zip</b> containing sessions).",
             parse_mode=ParseMode.HTML,
         )
         return
-    if not message.document.file_name or not message.document.file_name.lower().endswith(".session"):
+
+    fname = (message.document.file_name or "").lower()
+
+    # ── ZIP file: extract all .session files inside ───────────────────────────
+    if fname.endswith(".zip"):
+        try:
+            buf = io.BytesIO()
+            await message.bot.download(message.document, destination=buf)
+            file_bytes = buf.getvalue()
+        except Exception as e:
+            log.error("Error downloading premium zip file: %s", e)
+            await message.answer("❌ Failed to download the zip file. Please try again.", parse_mode=ParseMode.HTML)
+            return
+
+        extracted: list[tuple[str, bytes]] = []
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+                for zname in zf.namelist():
+                    if zname.lower().endswith(".session") and "__MACOSX" not in zname:
+                        phone = zname.split("/")[-1][:-len(".session")]
+                        if not phone:
+                            continue
+                        sess_bytes = zf.read(zname)
+                        extracted.append((phone, sess_bytes))
+        except Exception as e:
+            await message.answer(f"❌ Failed to read zip: {e}", parse_mode=ParseMode.HTML)
+            return
+
+        if not extracted:
+            await message.answer("❌ No <b>.session</b> files found inside the zip.", parse_mode=ParseMode.HTML)
+            return
+
+        # Add all extracted sessions without 2FA
+        for phone, sess_bytes in extracted:
+            collected.append({"phone": phone, "session_file": sess_bytes.hex(), "twofa": None})
+
+        await state.update_data(prem_collected=collected)
+        received = len(collected)
+
+        if received >= qty:
+            # All files received — finalize
+            await state.clear()
+            await _finalize_premium_order(message, order_ref, collected[:qty])
+        else:
+            await message.answer(
+                f"✅ Extracted <b>{len(extracted)}</b> session(s) from zip.\n"
+                f"<b>Progress: {received} / {qty} received</b>\n\n"
+                f"Upload more files to complete the order.",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    # ── Single .session file ──────────────────────────────────────────────────
+    if not fname.endswith(".session"):
         await message.answer(
-            "❌ Invalid file type. Please upload a <b>.session</b> file.",
+            "❌ Invalid file. Please upload a <b>.session</b> file or a <b>.zip</b> containing sessions.",
             parse_mode=ParseMode.HTML,
         )
         return
-    # Extract phone number from filename (e.g. "+12345678900.session" → "+12345678900")
+
     phone = message.document.file_name[:-len(".session")]
     try:
-        tg_file = await message.bot.get_file(message.document.file_id)
-        downloaded = await message.bot.download_file(tg_file.file_path)
-        file_bytes = downloaded.read() if hasattr(downloaded, "read") else bytes(downloaded)
+        buf = io.BytesIO()
+        await message.bot.download(message.document, destination=buf)
+        file_bytes = buf.getvalue()
     except Exception as e:
         log.error("Error downloading premium session file: %s", e)
         await message.answer("❌ Failed to download the file. Please try again.", parse_mode=ParseMode.HTML)
         return
-    await state.update_data(prem_phone=phone, prem_session_file=file_bytes)
+
+    # Temporarily store phone + file, then ask for 2FA
+    await state.update_data(prem_current_phone=phone, prem_current_file=file_bytes.hex())
     await state.set_state(AdminFulfillPremiumOrder.twofa_password)
     await message.answer(
         f"✅ Session file received for <code>{phone}</code>\n\n"
@@ -4007,18 +4164,41 @@ async def fsm_prem_fulfill_session_file(message: Message, state: FSMContext) -> 
 @router.message(AdminFulfillPremiumOrder.twofa_password)
 @admin_only
 async def fsm_prem_fulfill_twofa(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        await message.answer("❌ Please send the 2FA password as text, or <code>0</code> to skip.", parse_mode=ParseMode.HTML)
+        return
     raw = message.text.strip()
     twofa_enc: Optional[str] = None
     if raw != "0":
         twofa_enc = encrypt_privkey(raw)
-    twofa_plain = raw if raw != "0" else None
 
     data = await state.get_data()
-    order_ref = data["prem_order_ref"]
-    phone = data["prem_phone"]
-    session_file_data = data["prem_session_file"]
-    await state.clear()
+    order_ref: str = data["prem_order_ref"]
+    qty: int = data["prem_qty"]
+    collected: list = data.get("prem_collected", [])
+    phone: str = data["prem_current_phone"]
+    file_hex: str = data["prem_current_file"]
 
+    collected.append({"phone": phone, "session_file": file_hex, "twofa": twofa_enc})
+    received = len(collected)
+
+    if received >= qty:
+        # All files received — finalize
+        await state.clear()
+        await _finalize_premium_order(message, order_ref, collected[:qty])
+    else:
+        await state.update_data(prem_collected=collected, prem_current_phone=None, prem_current_file=None)
+        await state.set_state(AdminFulfillPremiumOrder.collecting_files)
+        await message.answer(
+            f"✅ File {received}/{qty} saved.\n\n"
+            f"<b>Progress: {received} / {qty} received</b>\n"
+            f"Upload the next <b>.session</b> file or a <b>.zip</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def _finalize_premium_order(message: Message, order_ref: str, collected: list) -> None:
+    """Create products for a fulfilled premium order and notify the buyer."""
     async with AsyncSessionFactory() as session:
         res = await session.execute(select(PremiumOrder).where(PremiumOrder.order_ref == order_ref))
         prem_order = res.scalar_one_or_none()
@@ -4026,45 +4206,52 @@ async def fsm_prem_fulfill_twofa(message: Message, state: FSMContext) -> None:
             await message.answer(f"❌ Premium order {order_ref} not found.")
             return
 
-        # Create a Product for this premium order
-        product = Product(
-            category=CATEGORY_TELEGRAM_PREMIUM,
-            country=prem_order.country,
-            phone_number=phone,
-            price=prem_order.price,
-            session_file_data=session_file_data,
-            twofa_password=twofa_enc,
-            status="Sold",
-        )
-        session.add(product)
-        await session.flush()
+        qty = len(collected)
+        product_ids: list[int] = []
 
-        # Update PremiumOrder
+        for item in collected:
+            phone = item["phone"]
+            sess_bytes = bytes.fromhex(item["session_file"])
+            twofa_enc = item["twofa"]
+
+            product = Product(
+                category=CATEGORY_TELEGRAM_PREMIUM,
+                country=prem_order.country,
+                phone_number=phone,
+                price=prem_order.price / qty,  # prem_order.price is total; divide to get per-account
+                session_file_data=sess_bytes,
+                twofa_password=twofa_enc,
+                status="Sold",
+            )
+            session.add(product)
+            await session.flush()
+            product_ids.append(product.id)
+
+            prem_completed_order = Order(
+                user_id=prem_order.user_id,
+                product_id=product.id,
+                status="Completed",
+            )
+            session.add(prem_completed_order)
+
+        # Update PremiumOrder — store first product id for compatibility
+        first_phone = collected[0]["phone"]
         await session.execute(
             update(PremiumOrder).where(PremiumOrder.order_ref == order_ref).values(
                 status="Completed",
-                phone_number=phone,
-                twofa_password=twofa_enc,
-                product_id=product.id,
+                phone_number=first_phone,
+                product_id=product_ids[0],
             )
         )
 
-        # Create an Order record so it appears in the user's "My Purchases" section
-        prem_completed_order = Order(
-            user_id=prem_order.user_id,
-            product_id=product.id,
-            status="Completed",
-        )
-        session.add(prem_completed_order)
-
-        # Increment numbers_bought counter for the user
+        # Increment numbers_bought counter
         await session.execute(
             update(User)
             .where(User.id == prem_order.user_id)
-            .values(numbers_bought=User.numbers_bought + 1)
+            .values(numbers_bought=User.numbers_bought + qty)
         )
 
-        # Update the most recent matching pending transaction to Completed
+        # Mark transaction as Completed
         _txn_res = await session.execute(
             select(Transaction)
             .where(
@@ -4085,37 +4272,81 @@ async def fsm_prem_fulfill_twofa(message: Message, state: FSMContext) -> None:
         await session.commit()
         buyer_id = prem_order.user_id
         country_name = prem_order.country
-        price = Decimal(str(prem_order.price))
-        pid = product.id
 
-    # Notify user
+    # Start OTP listeners for each product
+    for item, pid in zip(collected, product_ids):
+        sess_bytes = bytes.fromhex(item["session_file"])
+        await otp_manager.start_listener(pid, sess_bytes)
+
+    # Notify buyer — send one message per account
     flag = get_country_flag(country_name)
-    twofa_line = f"🔐 <b>2FA Password:</b> <code>{twofa_plain}</code>\n" if twofa_plain else ""
     try:
-        await message.bot.send_message(
-            buyer_id,
-            f"<tg-emoji emoji-id='5206607081334906820'>✅</tg-emoji> <b>Your Premium Order is Ready!</b>\n\n"
-            f"<tg-emoji emoji-id='5397782960512444700'>📌</tg-emoji> <b>Order ID:</b> <code>{order_ref}</code>\n"
-            f"<tg-emoji emoji-id='5197252827247841976'>📱</tg-emoji> <b>Number:</b> <code>{phone}</code>\n"
-            f"<tg-emoji emoji-id='5224450179368767019'>🌍</tg-emoji> <b>Country:</b> {flag} {country_name.title()}\n"
-            f"{twofa_line}"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<tg-emoji emoji-id='5274055917766202507'>📋</tg-emoji> <b>Next Steps:</b>\n"
-            f"<tg-emoji emoji-id='5382322671679708881'>1️⃣</tg-emoji> Open Telegram / Telegram X / TurboTel\n"
-            f"<tg-emoji emoji-id='5381990043642502553'>2️⃣</tg-emoji> Enter the number: <code>{phone}</code>\n"
-            f"<tg-emoji emoji-id='5381879959335738545'>3️⃣</tg-emoji> Tap Send Code in Telegram\n"
-            f"<tg-emoji emoji-id='5382054253403577563'>4️⃣</tg-emoji> Come back here and press 🔄 Get OTP\n\n"
-            f"<tg-emoji emoji-id='5456140674028019486'>⚡</tg-emoji> OTP is fetched instantly from the account!",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                apply_button_style(InlineKeyboardButton(text="Get OTP", callback_data=f"getotp_{pid}"), 'primary', "5449569374065152798"),
-            ]]),
-            parse_mode=ParseMode.HTML,
-        )
+        if qty == 1:
+            item = collected[0]
+            pid = product_ids[0]
+            twofa_plain = None
+            if item["twofa"]:
+                try:
+                    twofa_plain = decrypt_privkey(item["twofa"])
+                except Exception:
+                    twofa_plain = None
+            twofa_line = f"🔐 <b>2FA Password:</b> <code>{twofa_plain}</code>\n" if twofa_plain else ""
+            await message.bot.send_message(
+                buyer_id,
+                f"<tg-emoji emoji-id='5206607081334906820'>✅</tg-emoji> <b>Your Premium Order is Ready!</b>\n\n"
+                f"<tg-emoji emoji-id='5397782960512444700'>📌</tg-emoji> <b>Order ID:</b> <code>{order_ref}</code>\n"
+                f"<tg-emoji emoji-id='5197252827247841976'>📱</tg-emoji> <b>Number:</b> <code>{item['phone']}</code>\n"
+                f"<tg-emoji emoji-id='5224450179368767019'>🌍</tg-emoji> <b>Country:</b> {flag} {country_name.title()}\n"
+                f"{twofa_line}"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<tg-emoji emoji-id='5274055917766202507'>📋</tg-emoji> <b>Next Steps:</b>\n"
+                f"<tg-emoji emoji-id='5382322671679708881'>1️⃣</tg-emoji> Open Telegram / Telegram X / TurboTel\n"
+                f"<tg-emoji emoji-id='5381990043642502553'>2️⃣</tg-emoji> Enter the number: <code>{item['phone']}</code>\n"
+                f"<tg-emoji emoji-id='5381879959335738545'>3️⃣</tg-emoji> Tap Send Code in Telegram\n"
+                f"<tg-emoji emoji-id='5382054253403577563'>4️⃣</tg-emoji> Come back here and press 🔄 Get OTP\n\n"
+                f"<tg-emoji emoji-id='5456140674028019486'>⚡</tg-emoji> OTP is fetched instantly from the account!",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    apply_button_style(InlineKeyboardButton(text="Get OTP", callback_data=f"getotp_{pid}"), 'primary', "5449569374065152798"),
+                ]]),
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            # Summary header
+            await message.bot.send_message(
+                buyer_id,
+                f"<tg-emoji emoji-id='5206607081334906820'>✅</tg-emoji> <b>Your Premium Order is Ready! ({qty} accounts)</b>\n\n"
+                f"<tg-emoji emoji-id='5397782960512444700'>📌</tg-emoji> <b>Order ID:</b> <code>{order_ref}</code>\n"
+                f"<tg-emoji emoji-id='5224450179368767019'>🌍</tg-emoji> <b>Country:</b> {flag} {country_name.title()}\n"
+                f"<tg-emoji emoji-id='5197252827247841976'>📱</tg-emoji> <b>Quantity:</b> {qty}\n\n"
+                f"<i>Details for each account are sent below:</i>",
+                parse_mode=ParseMode.HTML,
+            )
+            for idx, (item, pid) in enumerate(zip(collected, product_ids), 1):
+                twofa_plain = None
+                if item["twofa"]:
+                    try:
+                        twofa_plain = decrypt_privkey(item["twofa"])
+                    except Exception:
+                        twofa_plain = None
+                twofa_line = f"🔐 <b>2FA:</b> <code>{twofa_plain}</code>\n" if twofa_plain else ""
+                await message.bot.send_message(
+                    buyer_id,
+                    f"<tg-emoji emoji-id='5235711785482341993'>🎉</tg-emoji> <b>Account {idx}/{qty}</b>\n\n"
+                    f"<tg-emoji emoji-id='5197252827247841976'>📱</tg-emoji> <b>Number:</b> <code>{item['phone']}</code>\n"
+                    f"{twofa_line}"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"<tg-emoji emoji-id='5381990043642502553'>2️⃣</tg-emoji> Enter: <code>{item['phone']}</code>\n"
+                    f"<tg-emoji emoji-id='5381879959335738545'>3️⃣</tg-emoji> Tap Send Code, then press Get OTP",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        apply_button_style(InlineKeyboardButton(text=f"Get OTP #{idx}", callback_data=f"getotp_{pid}"), 'primary', "5449569374065152798"),
+                    ]]),
+                    parse_mode=ParseMode.HTML,
+                )
     except Exception as exc:
         log.warning("Could not notify premium buyer %s: %s", buyer_id, exc)
 
     await message.answer(
-        f"✅ Premium order <code>{order_ref}</code> fulfilled and buyer notified.",
+        f"✅ Premium order <code>{order_ref}</code> fulfilled ({qty} account(s)) — buyer notified.",
         reply_markup=build_admin_keyboard(),
         parse_mode=ParseMode.HTML,
     )
@@ -6350,6 +6581,35 @@ async def cmd_remove(message: Message) -> None:
             await message.answer(REMOVE_USAGE, parse_mode=ParseMode.HTML)
             return
 
+        # ── tp: remove from premium_countries (manually managed) ─────────────
+        if subcmd == "tp":
+            async with AsyncSessionFactory() as session:
+                res = await session.execute(
+                    select(PremiumCountry).where(PremiumCountry.country == country)
+                )
+                pc = res.scalar_one_or_none()
+            if pc is None:
+                flag = get_country_flag(country)
+                await message.answer(
+                    f"❌ No Telegram Premium country found for {flag} <b>{country.title()}</b>.\n"
+                    f"Use the exact country name as shown in the bot.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            async with AsyncSessionFactory() as session:
+                await session.execute(
+                    delete(PremiumCountry).where(PremiumCountry.country == country)
+                )
+                await session.commit()
+            flag = get_country_flag(country)
+            await message.answer(
+                f"✅ <b>Removed Telegram Premium country</b>\n\n"
+                f"🌍 Country: {flag} <b>{country.title()}</b>\n"
+                f"The country button has been removed from the Telegram Premium menu.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
         numbers = number_tokens[:10]  # max 10
 
         async with AsyncSessionFactory() as session:
@@ -6498,6 +6758,90 @@ async def cmd_remove(message: Message) -> None:
 
     # ── unrecognised subcommand ───────────────────────────────────────────────
     await message.answer(REMOVE_USAGE, parse_mode=ParseMode.HTML)
+
+
+# ── /removecustom command ─────────────────────────────────────────────────────
+
+@router.message(Command("removecustom"))
+@admin_only
+async def cmd_removecustom(message: Message) -> None:
+    """List all custom categories as inline buttons for removal."""
+    async with AsyncSessionFactory() as session:
+        rows = await session.execute(select(CustomCategory).order_by(CustomCategory.name))
+        custom_cats = rows.scalars().all()
+
+    if not custom_cats:
+        await message.answer("📂 No custom categories found.", parse_mode=ParseMode.HTML)
+        return
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for cc in custom_cats:
+        btn = apply_button_style(
+            InlineKeyboardButton(
+                text=f"🗑 {cc.name}",
+                callback_data=f"removecustom_{cc.slug}",
+            ),
+            'danger', "5416041192905265756"
+        )
+        row.append(btn)
+        if len(row) == 2:
+            kb_rows.append(row)
+            row = []
+    if row:
+        kb_rows.append(row)
+
+    await message.answer(
+        "🗂 <b>Remove Custom Category</b>\n\n"
+        "Select a category to remove it and <b>all its products</b>:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(F.data.startswith("removecustom_"))
+@admin_only
+async def cb_removecustom(query: CallbackQuery) -> None:
+    """Delete a custom category and all its products."""
+    await query.answer()
+    slug = query.data.replace("removecustom_", "", 1)
+
+    async with AsyncSessionFactory() as session:
+        cc_res = await session.execute(select(CustomCategory).where(CustomCategory.slug == slug))
+        cc = cc_res.scalar_one_or_none()
+        if cc is None:
+            await query.answer("Category not found.", show_alert=True)
+            return
+        cat_name = cc.name
+
+        # Load products to delete
+        prod_res = await session.execute(select(Product).where(Product.category == slug))
+        products = prod_res.scalars().all()
+        product_ids = [p.id for p in products]
+
+        # Delete orders/transactions for these products using bulk deletes
+        if product_ids:
+            ord_rows = await session.execute(select(Order).where(Order.product_id.in_(product_ids)))
+            order_ids = [o.id for o in ord_rows.scalars().all()]
+            if order_ids:
+                await session.execute(delete(Transaction).where(Transaction.order_id.in_(order_ids)))
+            await session.execute(delete(Order).where(Order.product_id.in_(product_ids)))
+            await session.execute(delete(Product).where(Product.id.in_(product_ids)))
+
+        # Delete the custom category itself
+        await session.execute(delete(CustomCategory).where(CustomCategory.slug == slug))
+        await session.commit()
+
+    # Stop OTP listeners
+    for pid in product_ids:
+        await otp_manager.stop_product(pid)
+
+    await query.message.edit_text(
+        f"✅ <b>Custom category removed</b>\n\n"
+        f"📁 Category: <b>{cat_name}</b>\n"
+        f"🗑 {len(product_ids)} product(s) and all associated orders deleted.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(Command("listall"))
